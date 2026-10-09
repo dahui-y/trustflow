@@ -1,0 +1,342 @@
+---
+name: uq-mlip-md-workflow
+description: "Train a UQ model for a pretrained MLIP using uq-mlip, run an MD simulation decorated with per-atom uncertainty, and output predicted quantiles. Use when: training uncertainty quantification model on MLIP validation set, wrapping MACE, UMA, or CHGNet calculator with UQ, running ASE molecular dynamics with per-atom UQ, extracting quantile predictions from MD trajectory, monitoring UQ profile during simulation."
+argument-hint: "<backend: mace|uma|chgnet> <validation.xyz> <md_input.xyz>"
+---
+
+# UQ-MLIP MD Workflow
+
+Train a per-atom **aleatoric (prediction interval) uncertainty quantification** model on a pretrained MLIP validation set, run an MD simulation using that MLIP, and output predicted quantiles for every frame.
+
+## When to Use
+
+- You have a pretrained MACE, UMA, or CHGNet MLIP and a validation dataset
+- You want to attach per-atom UQ to an existing ASE calculator
+- You need to monitor model reliability during MD simulations
+- You want to output quantile uncertainty estimates (e.g., 5th–95th percentile) frame-by-frame
+
+---
+
+## Prerequisites
+
+Install `uq-mlip` with the appropriate backend. MACE and UMA require **separate environments** due to incompatible `e3nn` versions; CHGNet is independent of `e3nn` and can share an environment with either.
+
+```bash
+# MACE backend
+pip install -e ".[mace]"
+
+# UMA backend
+pip install -e ".[uma]"
+# If ~/.cache is not writable:
+export FAIRCHEM_CACHE_DIR=/path/to/writable/fairchem-cache
+
+# CHGNet backend
+pip install -e ".[chgnet]"
+```
+
+You need:
+- A **validation set** in any ASE-readable format (`.xyz`, extended XYZ, etc.) — configurations from the MLIP's validation split
+- An **MD input configuration** (ASE-readable) and MD parameters (timestep, temperature, ensemble, steps)
+- The pretrained MLIP checkpoint or model identifier
+
+---
+
+## Step 1: Extract Embeddings from the Validation Set
+
+Extract per-atom embeddings and per-atom energies from the validation set using the MLIP backbone. The output is a compressed `.npz` file used for UQ model training.
+
+### CLI
+
+```bash
+# MACE
+uq-mlip extract \
+  --backend mace \
+  --sample validation.xyz \
+  --savedir embeddings/ \
+  --model-size medium-0b \
+  --checkpoint /path/to/checkpoint.pt \   # omit for foundation model defaults
+  --device cuda \
+  --index ":"
+
+# UMA
+uq-mlip extract \
+  --backend uma \
+  --sample validation.xyz \
+  --savedir embeddings/ \
+  --model-size uma-m-1p1 \
+  --head omat \
+  --device cuda \
+  --index ":"
+
+# CHGNet (crystal model; non-periodic inputs are auto-wrapped in a vacuum box)
+uq-mlip extract \
+  --backend chgnet \
+  --sample validation.xyz \
+  --savedir embeddings/ \
+  --model-size 0.3.0 \
+  --device cuda \
+  --index ":"
+```
+
+Output: `embeddings/embedding_info_<validation_stem>.npz`
+
+### Python
+
+```python
+from uq_mlip.backends import get_extractor
+
+extractor = get_extractor("mace", model="medium-0b", device="cuda")
+# extractor = get_extractor("uma", model="uma-m-1p1", head="omat", device="cuda")
+# extractor = get_extractor("chgnet", model="0.3.0", device="cuda")
+
+output_path = extractor.extract_file(
+    "validation.xyz",
+    savedir="embeddings/",
+    index=":",
+)
+print(output_path)
+```
+
+---
+
+## Step 2: Train the UQ Model
+
+Train a quantile gradient-boosted machine (GBM) on the extracted embeddings. The model learns to predict lower/upper quantile bounds for per-atom energies. **Train on the validation set, not the training set**, so the model characterizes in-distribution uncertainty.
+
+### CLI
+
+```bash
+uq-mlip train \
+  --embeddings embeddings/embedding_info_validation.npz \
+  --savedir uq-model/ \
+  --lower-alpha 0.05 \
+  --upper-alpha 0.95 \
+  --estimators 100 \
+  --device cpu
+```
+
+Output: `uq-model/GBMRegressor_0.05-0.95.pkl`
+
+### Python
+
+```python
+from uq_mlip.model import UQModel
+
+model = UQModel(
+    savedir="uq-model/",
+    lower_alpha=0.05,
+    upper_alpha=0.95,
+    n_estimators=100,
+)
+model.fit(embeddings)          # embeddings is an EmbeddingData object
+# or from file:
+model = UQModel.train_from_file("embeddings/embedding_info_validation.npz", "uq-model/")
+```
+
+**Tuning guidance:**
+- `lower_alpha` / `upper_alpha`: define the quantile interval (default 5th–95th percentile). Widen for conservative bounds.
+- `n_estimators`: more rounds → better fit but slower training. 100–500 is typical.
+- Increase `n_estimators` if the UQ profile on a held-out validation subset is noisy.
+
+---
+
+## Step 3: Run MD with the UQ-Decorated Calculator
+
+Wrap the base MLIP ASE calculator with `UQCalculator` (or `with_uq`). Energy and forces continue to come from the base calculator; per-atom UQ is appended to `atoms.arrays` on every step.
+
+```python
+from ase import units
+from ase.io import read, write
+from ase.md.langevin import Langevin
+from ase.md.velocitydistribution import MaxwellBoltzmannDistribution
+
+from uq_mlip import with_uq
+
+# --- build your base MLIP calculator ---
+# MACE example:
+from mace.calculators import mace_mp
+base_calc = mace_mp(model="medium-0b", default_dtype="float32", device="cuda")
+
+# UMA example:
+# from fairchem.core import pretrained_mlip
+# base_calc = pretrained_mlip.get_predict_unit("uma-m-1p1", device="cuda")
+
+# CHGNet example:
+# from chgnet.model.dynamics import CHGNetCalculator
+# base_calc = CHGNetCalculator()
+
+# --- wrap with UQ ---
+uq_calc = with_uq(
+    base_calc,
+    uq_model="uq-model/",   # directory containing the .pkl file
+    backend="mace",          # "mace", "uma", or "chgnet"
+    model="medium-0b",       # passed to the extractor; must match base_calc
+    lower_alpha=0.05,
+    upper_alpha=0.95,
+    device="cuda",
+)
+
+# --- load initial structure ---
+atoms = read("md_input.xyz")
+atoms.calc = uq_calc
+
+# --- initialize velocities ---
+temperature_K = 300
+MaxwellBoltzmannDistribution(atoms, temperature_K=temperature_K)
+
+# --- set up MD ---
+timestep_fs = 1.0
+dyn = Langevin(
+    atoms,
+    timestep=timestep_fs * units.fs,
+    temperature_K=temperature_K,
+    friction=0.01 / units.fs,
+)
+
+# --- trajectory and UQ logging ---
+traj_file = "md_trajectory.xyz"
+uq_rows = []
+
+def log_step():
+    frame = atoms.copy()
+    frame.arrays["uq"] = atoms.arrays["uq"].copy()
+    frame.arrays["uq_lower"] = atoms.arrays["uq_lower"].copy()
+    frame.arrays["uq_upper"] = atoms.arrays["uq_upper"].copy()
+    write(traj_file, frame, append=True)
+    uq_rows.append({
+        "step": dyn.nsteps,
+        "mean_uq": float(atoms.arrays["uq"].mean()),
+        "max_uq":  float(atoms.arrays["uq"].max()),
+    })
+
+dyn.attach(log_step, interval=1)
+dyn.run(500)   # number of MD steps
+```
+
+---
+
+## Step 4: Output Predicted Quantiles
+
+### From `atoms.arrays` (per-step, per-atom)
+
+After each calculation, three arrays are available on `atoms`:
+
+| Array | Description |
+|---|---|
+| `atoms.arrays["uq"]` | Per-atom uncertainty — half the quantile interval `(upper − lower) / 2` |
+| `atoms.arrays["uq_lower"]` | Lower quantile prediction (e.g., 5th percentile) |
+| `atoms.arrays["uq_upper"]` | Upper quantile prediction (e.g., 95th percentile) |
+
+### From a saved trajectory (batch)
+
+If the MD was run without live logging, or you want to re-score a trajectory:
+
+```bash
+# 1. Extract embeddings from the trajectory
+uq-mlip extract \
+  --backend mace \
+  --sample md_trajectory.xyz \
+  --savedir embeddings/ \
+  --device cuda
+
+# 2. Predict quantiles
+uq-mlip predict \
+  --embeddings embeddings/embedding_info_md_trajectory.npz \
+  --model-dir uq-model/ \
+  --savedir results/ \
+  --lower-alpha 0.05 \
+  --upper-alpha 0.95
+```
+
+Output: `results/UQ_md_trajectory.csv.gz`
+
+Columns: `sample_idx`, `atom_idx`, `element`, `uq_lower`, `uq_upper`, `uq`
+
+### UQ profile from CSV
+
+```python
+import pandas as pd
+
+df = pd.read_csv("results/UQ_md_trajectory.csv.gz")
+profile = (
+    df.groupby("sample_idx")
+    .agg(mean_uq=("uq", "mean"), max_uq=("uq", "max"))
+    .reset_index()
+)
+print(profile)
+```
+
+### Python batch prediction
+
+```python
+from uq_mlip.data import load_embeddings
+from uq_mlip.model import UQModel
+
+embeddings = load_embeddings("embeddings/embedding_info_md_trajectory.npz")
+model = UQModel.from_dir("uq-model/", lower_alpha=0.05, upper_alpha=0.95)
+predictions = model.predict_embeddings(embeddings)
+# predictions["lower"], predictions["upper"], predictions["uncertainty"]
+```
+
+---
+
+## What This Measures
+
+This method quantifies **aleatoric (prediction interval) uncertainty**: the variance in per-atom energy predictions, estimated from residuals in the validation set. It captures how much energy scatter the MLIP exhibits locally.
+
+**It does NOT measure:**
+- Out-of-distribution detection (epistemic uncertainty)
+- Whether an atom is truly outside the training domain
+- Ensemble disagreement
+
+However, high aleatoric uncertainty often co-occurs with OOD regions, since unusual chemistries tend to have larger residuals.
+
+## Decision Checklist
+
+- [ ] Validation XYZ contains configurations **from the MLIP's actual validation split**, not the training set
+- [ ] Backend (`mace`, `uma`, or `chgnet`) matches the base calculator — use separate conda/venv environments for MACE and UMA
+- [ ] `model` / `model-size` in the extractor exactly matches the checkpoint used for `base_calc`
+- [ ] `lower_alpha` / `upper_alpha` are **identical** at extract, train, and predict steps
+- [ ] MD trajectory is written with per-atom arrays preserved (use `write(..., append=True)` with `frame.arrays` copied)
+
+## Interpreting Results
+
+- **High `uq`** (large interval) at a frame → the MLIP exhibits large residual variance for these atoms; predictions should be treated conservatively
+- **Sudden spike** in `max_uq` → the atoms entered a high-variance region of the MLIP's function (unusual local environment); inspect for chemical changes or rare configurations
+- **All `uq` near zero** → the trajectory stays in well-constrained regions where the MLIP has learned precise, low-scatter predictions
+
+## Caveats and Limitations
+
+### Quantile Miscalibration Under Shift
+The nominal coverage of the quantiles (e.g., 90% for 5th–95th) assumes the test data has similar residual distributions to the validation set. If the MD trajectory is chemically very different, actual coverage will deviate.
+
+Aleatoric UQ is **conditional on the embedding**. If the embedding distribution shifts, the residual distribution you learned no longer applies. The GBM doesn't know it's extrapolating; it just makes a prediction for an embedding far from any training example. Report the coverage (or lack thereof) with your results if you suspect distribution shift
+
+### Temporal Correlation
+In MD, consecutive frames are highly correlated: atoms move only a small distance per timestep, so embeddings stay similar. This means:
+- If frame *t* has high UQ, frame *t+1* will **almost certainly also have high UQ** (not independent evidence of a problem)
+- UQ profiles will show **strong autocorrelation**, not sudden jumps
+- Once the trajectory enters a high-variance region of the MLIP's function (e.g., breaking/forming bonds), it may stay there for many frames before escaping
+- You cannot treat a UQ drop at frame *t+1* as strong statistical evidence that the trajectory "recovered" from a high-UQ frame
+
+**This is not a failure of the method**, but rather an expected property of any instantaneous frame-by-frame analysis on a slow-moving trajectory. Interpret UQ profiles as showing **persistent regions** of high/low variance, not frame-to-frame independence.
+
+## References
+
+- [UQCalculator / with_uq API](../../../src/uq_mlip/api.py)
+- [UQModel training and prediction](../../../src/uq_mlip/model.py)
+- [Embedding data schema](../../../src/uq_mlip/data.py)
+- [MACE backend extractor](../../../src/uq_mlip/backends/mace.py)
+- [UMA backend extractor](../../../src/uq_mlip/backends/uma.py)
+- [CHGNet backend extractor](../../../src/uq_mlip/backends/chgnet.py)
+- [Hello world example](../../../examples/hello_world/train_run_visualize.py)
+- [CLI reference](../../../src/uq_mlip/cli.py)
+
+- [UQCalculator / with_uq API](../../../src/uq_mlip/api.py)
+- [UQModel training and prediction](../../../src/uq_mlip/model.py)
+- [Embedding data schema](../../../src/uq_mlip/data.py)
+- [MACE backend extractor](../../../src/uq_mlip/backends/mace.py)
+- [UMA backend extractor](../../../src/uq_mlip/backends/uma.py)
+- [CHGNet backend extractor](../../../src/uq_mlip/backends/chgnet.py)
+- [Hello world example](../../../examples/hello_world/train_run_visualize.py)
+- [CLI reference](../../../src/uq_mlip/cli.py)
