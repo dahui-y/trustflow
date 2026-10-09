@@ -281,12 +281,24 @@ desc, atom_feat, struct_feat = dp.eval_embedding(coords, cells, atom_types)
     → PRELIMINARY_RESULTS.md
 ```
 
-**需要用户拍板的决策**
+**已确认的决策（2026-10-09）**
 
-1. **FlowMM checkpoint 来源。** README 无发布链接。选项：(a) 作者公开权重（需联系或搜索）；(b) 在 MP-20 上自训（`python scripts_model/run.py data=mp_20 model=abits_params`，默认 2000 epoch，单卡估计以天计，可减到几百 epoch 换取"能用的"模型）；(c) 临时用 DiffCSP 自训替代（更快但偏离 "FlowMM backbone" 叙事）。**建议先尝试 (a)，同时启动 (b) 的短训练作为保底。**
-2. **中间步的原子类型怎么处理。** 选项：(a) 用每步 analog bits 解码的"当前猜测"（忠实于生成过程，但早期几乎是随机元素，MLIP 误差会被元素噪声主导）；(b) 用最终步的类型回填到所有步（只测量几何的 OOD 程度）。**建议主图用 (b)，(a) 作为补充**，并在报告中明确说明。
-3. **reliability estimator 的主选。** 选项：(a) UQ-MLIP 默认 GBM（目标 = site energy）；(b) 同一 GBM 但目标换成 per-atom CHGNet-vs-DPA 力差；(c) 直接用 D_F 本身。Milestone 0 建议 **先做 (a) + 用 (c) 验证**，这正是 Exp A + Exp B 的结构。
-4. **DPA head 选择**：`MP_traj_v024_alldata_mixu`（与 CHGNet 同训练分布，更"公平"）vs `OMat24`（更强但分布不同）。建议主用 MP_traj，OMat24 作为 robustness 检查。
+| # | 决策 | 结论 |
+|---|---|---|
+| 1 | FlowMM checkpoint 来源 | **在 MP-20 上自训**，按 FlowMM README 的 Unconditional Training 流程：`python scripts_model/run.py data=mp_20 model=abits_params` |
+| 2 | 中间步原子类型 | 主图用最终步类型回填（只测几何 OOD）；每步解码的"当前猜测"作为补充 |
+| 3 | reliability estimator 主选 | UQ-MLIP 默认 GBM（目标 = site energy）作为 Exp A；CHGNet-vs-DPA 力差 D_F 作为 Exp B 验证 |
+| 4 | DPA head | 主用 `MP_traj_v024_alldata_mixu`，`OMat24` 作为 robustness 检查 |
+
+**自训 FlowMM 的要点（来自 `scripts_model/run.py` 与 `conf/default.yaml`）**
+
+- 默认 `train_max_epochs: 2000`（`conf/data/mp_20.yaml`），单卡、`precision: 32`、`gradient_clip_val: 0.5`。**先跑 1 个 epoch 测时间**再决定总 epoch 数。
+- `every_n_epochs_checkpoint.every_n_epochs: 100, save_top_k: -1`：每 100 epoch 保存一个 checkpoint 到 `<run_dir>/every_n_epochs/`。这意味着 **训练到几百 epoch 时就可以用早期 checkpoint 启动轨迹审计**，不必等 2000 epoch 结束。另有 `monitor_metric: val/loss` 的 top-1 checkpoint。
+- 输出目录由 `conf/hydra/trash.yaml` 决定：`./runs/trash/<date>/<time>/<model>-<vectorfield>-<id>/`，其中包含 `.hydra/config.yaml`。`load_cfg`（`eval_utils.py:140`）靠这个文件定位，**不要移动 checkpoint 离开其 run 目录**。`runs/` 已在 `.gitignore`。
+- wandb 默认 `mode: online`。无账号时设置环境变量 `WANDB_MODE=offline` 或 `disabled`（`run.py:136` 读取 `WANDB_MODE`）。注意 `load_id_from_wandb` 等辅助函数依赖 run 目录下的 `wandb/` 子目录，但 `load_model` 不依赖。
+- `preprocess_workers: 30`、`num_workers: 40` 按机器核数调低。首次加载会把 CSV 预处理为 `data/mp_20/{train,val,test}_ori.pt`（`.gitignore` 的 `*.pt` 规则会忽略它们）。
+- `val_check_interval: 5` 是 epoch 为单位的验证频率，验证只算 loss（`val.compute_nll: false`），开销可接受。
+- 模型配置 `abits_params`：`self_cond: false`，满足 §1.2 对 `entire_traj` 的要求。
 
 ---
 

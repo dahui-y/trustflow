@@ -209,8 +209,10 @@ FlowMM → MP-20 sampling → trajectory extraction → CHGNet / MLIP
 
 ---
 
-## 仓库现状（供后续 session 参考）
+## 仓库现状与决策记录（供后续 session 参考）
 
-- 本仓库是 FlowMM 官方代码的 fork，backbone 位于 `src/flowmm`，数据位于 `data/mp_20` 等。
-- `help_code/` 下已放置参考代码：DiffCSP、OMatG、UQ-MLIP、chgnet、deepmd-kit。
-- 下一步计划：阅读 `help_code` 与 `src/flowmm`，生成 `REFERENCE_CODE_MAP.md`，确认可复用模块、sampling hook 位置和数据格式衔接。该步骤不实现 TrustFlow 代码。
+- 本仓库是 FlowMM 官方代码的 fork，backbone 位于 `src/flowmm`，数据位于 `data/mp_20` 等（LFS 指针）。
+- `help_code/` 下已放置参考代码：DiffCSP、OMatG、UQ-MLIP、chgnet、deepmd-kit。代码地图见 `REFERENCE_CODE_MAP.md`。
+- 项目归属：深势"AI for Science 基础模型"方向。研究对象是 Generative Foundation Model 与 Large Atomic Model 的可信协同，不是 Agent、不是 Infra。
+- 2026-10-09 已确认：FlowMM checkpoint 在 MP-20 上自训；中间步原子类型主图用最终类型回填；reliability estimator 主选 UQ-MLIP GBM，用 CHGNet-vs-DPA 力差验证；DPA head 主用 MP_traj。详见 `REFERENCE_CODE_MAP.md` §6。
+- 转向条件：若 UQ 与 MLIP 误差无关，转向研究 reliability estimator 本身；若 fixed guidance 无 negative transfer，先检查 OOD 程度与 guidance 强度；若 FlowMM 环境无法跑通，generator adapter 允许切换到其他 flow backbone。
