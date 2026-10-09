@@ -1,0 +1,50 @@
+cmake_minimum_required(VERSION 3.25.2)
+project(deepmd_api_test)
+
+file(GLOB TEST_SRC test_*.cc)
+
+add_executable(runUnitTests_cc ${TEST_SRC})
+target_link_libraries(runUnitTests_cc GTest::gtest_main ${LIB_DEEPMD_CC}
+                      coverage_config)
+if(ENABLE_TENSORFLOW)
+  target_compile_definitions(runUnitTests_cc PRIVATE BUILD_TENSORFLOW)
+  # Lifecycle tests instantiate the backend classes directly, so they need both
+  # the backend symbols and TensorFlow's public header search path.
+  target_link_libraries(
+    runUnitTests_cc deepmd_backend_tf TensorFlow::tensorflow_cc
+    TensorFlow::tensorflow_framework)
+endif()
+if(ENABLE_PYTORCH)
+  target_compile_definitions(runUnitTests_cc PRIVATE BUILD_PYTORCH)
+  # Link torch so __has_include(<torch/csrc/inductor/...>) succeeds and
+  # BUILD_PT_EXPT is set for the test binary; otherwise pt_expt tests all
+  # GTEST_SKIP() with "PyTorch support is not enabled".
+  target_link_libraries(runUnitTests_cc "${TORCH_LIBRARIES}")
+endif()
+if(ENABLE_JAX)
+  target_compile_definitions(runUnitTests_cc PRIVATE BUILD_JAX)
+  # DeepPotJAX lifecycle tests instantiate the backend directly to exercise
+  # cleanup without relying on the dlopen plugin facade.
+  target_link_libraries(runUnitTests_cc deepmd_backend_jax)
+endif()
+if(ENABLE_PADDLE)
+  target_compile_definitions(runUnitTests_cc PRIVATE BUILD_PADDLE)
+endif()
+
+if(UNIX AND NOT APPLE)
+  find_library(RT_LIBRARY rt)
+  if(RT_LIBRARY)
+    target_link_libraries(runUnitTests_cc ${RT_LIBRARY})
+  endif()
+endif()
+
+target_precompile_headers(runUnitTests_cc PRIVATE test_utils.h)
+add_test(
+  NAME runUnitTest_cc
+  COMMAND runUnitTests_cc
+  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+set_tests_properties(runUnitTest_cc PROPERTIES ENVIRONMENT
+                                               "TF_DISABLE_MLIR_BRIDGE=1")
+set_target_properties(runUnitTests_cc PROPERTIES INSTALL_RPATH "$ORIGIN/../lib")
+target_compile_definitions(runUnitTests_cc PUBLIC ${prec_def})
+install(TARGETS runUnitTests_cc DESTINATION bin/)

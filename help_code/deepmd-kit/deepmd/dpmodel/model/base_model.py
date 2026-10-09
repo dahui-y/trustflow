@@ -1,0 +1,335 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
+import inspect
+import json
+from abc import (
+    ABC,
+    abstractmethod,
+)
+from typing import (
+    Any,
+)
+
+from deepmd.utils.data_system import (
+    DeepmdDataSystem,
+)
+from deepmd.utils.plugin import (
+    PluginVariant,
+    make_plugin_registry,
+)
+
+
+def make_base_model() -> type[object]:
+    class BaseBaseModel(ABC, PluginVariant, make_plugin_registry("model")):
+        """Base class for final exported model that will be directly used for inference.
+
+        The class defines some abstractmethods that will be directly called by the
+        inference interface. If the final model class inherits some of those methods
+        from other classes, `BaseModel` should be inherited as the last class to ensure
+        the correct method resolution order.
+
+        This class is backend-indepedent.
+
+        See Also
+        --------
+        deepmd.dpmodel.model.base_model.BaseModel
+            BaseModel class for DPModel backend.
+        """
+
+        def __new__(cls, *args: Any, **kwargs: Any) -> "BaseModel":
+            if inspect.isabstract(cls):
+                # getting model type based on fitting type
+                model_type = kwargs.get("type", "standard")
+                if model_type == "standard":
+                    model_type = kwargs.get("fitting", {}).get("type", "ener")
+                cls = cls.get_class_by_type(model_type)
+            return object.__new__(cls)
+
+        @abstractmethod
+        def __call__(self, *args: Any, **kwds: Any) -> Any:
+            """Inference method.
+
+            Parameters
+            ----------
+            *args : Any
+                The input data for inference.
+            **kwds : Any
+                The input data for inference.
+
+            Returns
+            -------
+            Any
+                The output of the inference.
+            """
+            pass
+
+        @abstractmethod
+        def get_type_map(self) -> list[str]:
+            """Get the type map."""
+
+        @abstractmethod
+        def get_rcut(self) -> float:
+            """Get the cut-off radius."""
+
+        @abstractmethod
+        def get_dim_fparam(self) -> int:
+            """Get the number (dimension) of frame parameters of this atomic model."""
+
+        @abstractmethod
+        def get_dim_aparam(self) -> int:
+            """Get the number (dimension) of atomic parameters of this atomic model."""
+
+        @abstractmethod
+        def get_sel_type(self) -> list[int]:
+            """Get the selected atom types of this model.
+
+            Only atoms with selected atom types have atomic contribution
+            to the result of the model.
+            If returning an empty list, all atom types are selected.
+            """
+
+        @abstractmethod
+        def is_aparam_nall(self) -> bool:
+            """Check whether the shape of atomic parameters is (nframes, nall, ndim).
+
+            If False, the shape is (nframes, nloc, ndim).
+            """
+
+        @abstractmethod
+        def model_output_type(self) -> list[str]:
+            """Get the output type for the model."""
+
+        def adam_route_patterns(self) -> list[str]:
+            """Return model-relative parameter name patterns for HybridMuon's AdamW path.
+
+            Each pattern is a substring of a parameter name. Compositions
+            prefix their children's patterns with the corresponding attribute
+            names and indices.
+            """
+            return []
+
+        def has_spin(self) -> bool:
+            """Returns whether the model has spin input and output.
+
+            Concrete default ``False`` so non-spin models across all backends
+            (which subclass this same base) need no change; spin-capable
+            model classes override this method to return ``True``.
+            """
+            return False
+
+        def has_chg_spin_ebd(self) -> bool:
+            """Return whether the model conditions on charge/spin embedding.
+
+            Concrete default ``False``; models wrapping an atomic model
+            override to delegate.
+            """
+            return False
+
+        def get_dim_chg_spin(self) -> int:
+            """Return the charge/spin condition width (0 if unsupported)."""
+            return 0
+
+        def get_default_chg_spin(self) -> list | None:
+            """Return default charge/spin conditions, or ``None`` if none
+            are configured. ``is not None`` is the support predicate.
+            """
+            return None
+
+        def get_var_name(self) -> str | None:
+            """Return the fitted property's variable name, or ``None`` if
+            this is not a property model. ``is not None`` is the support
+            predicate.
+            """
+            return None
+
+        def get_task_dim(self) -> int:
+            """Return the property output dimension (property models only).
+
+            Raises
+            ------
+            NotImplementedError
+                If the model is not a property model.
+            """
+            raise NotImplementedError("get_task_dim: property models only")
+
+        def get_intensive(self) -> bool:
+            """Return whether the fitted property is intensive."""
+            return False
+
+        @abstractmethod
+        def serialize(self) -> dict:
+            """Serialize the model.
+
+            Returns
+            -------
+            dict
+                The serialized data
+            """
+            pass
+
+        @classmethod
+        def deserialize(cls, data: dict) -> "BaseBaseModel":
+            """Deserialize the model.
+
+            Parameters
+            ----------
+            data : dict
+                The serialized data
+
+            Returns
+            -------
+            BaseModel
+                The deserialized model
+            """
+            if inspect.isabstract(cls):
+                model_type = data.get("type", "standard")
+                if model_type == "standard":
+                    model_type = data.get("fitting", {}).get("type", "ener")
+                if model_type == "spin_ener":
+                    # SpinModel is not a BaseModel subclass and cannot be
+                    # registered via the plugin registry.  Dispatch directly.
+                    from deepmd.dpmodel.model.spin_model import (
+                        SpinModel,
+                    )
+
+                    return SpinModel.deserialize(data)
+                return cls.get_class_by_type(model_type).deserialize(data)
+            raise NotImplementedError(f"Not implemented in class {cls.__name__}")
+
+        model_def_script: str
+        """The model definition script."""
+        min_nbor_dist: float | None
+        """The minimum distance between two atoms. Used for model compression.
+        None when skipping neighbor statistics.
+        """
+
+        @abstractmethod
+        def get_model_def_script(self) -> str:
+            """Get the model definition script."""
+            pass
+
+        @abstractmethod
+        def get_min_nbor_dist(self) -> float | None:
+            """Get the minimum distance between two atoms."""
+            pass
+
+        @abstractmethod
+        def get_nnei(self) -> int:
+            """Returns the total number of selected neighboring atoms in the cut-off radius."""
+            # for C++ interface
+            pass
+
+        @abstractmethod
+        def get_nsel(self) -> int:
+            """Returns the total number of selected neighboring atoms in the cut-off radius."""
+            pass
+
+        @classmethod
+        @abstractmethod
+        def update_sel(
+            cls,
+            train_data: DeepmdDataSystem,
+            type_map: list[str] | None,
+            local_jdata: dict,
+        ) -> tuple[dict, float | None]:
+            """Update the selection and perform neighbor statistics.
+
+            Parameters
+            ----------
+            train_data : DeepmdDataSystem
+                data used to do neighbor statistics
+            type_map : list[str], optional
+                The name of each type of atoms
+            local_jdata : dict
+                The local data refer to the current class
+
+            Returns
+            -------
+            dict
+                The updated local data
+            float
+                The minimum distance between two atoms
+            """
+            # getting model type based on fitting type
+            model_type = local_jdata.get("type", "standard")
+            if model_type == "standard":
+                model_type = local_jdata.get("fitting", {}).get("type", "ener")
+            cls = cls.get_class_by_type(model_type)
+            return cls.update_sel(train_data, type_map, local_jdata)
+
+        @abstractmethod
+        def get_observed_type_list(self) -> list[str]:
+            """Get observed types (elements) of the model during data statistics.
+
+            Returns
+            -------
+            list[str]
+                A list of the observed type names in this model.
+            """
+            pass
+
+        def enable_compression(
+            self,
+            table_extrapolate: float = 5,
+            table_stride_1: float = 0.01,
+            table_stride_2: float = 0.1,
+            check_frequency: int = -1,
+        ) -> None:
+            """Enable model compression by tabulation.
+
+            Parameters
+            ----------
+            table_extrapolate
+                The scale of model extrapolation
+            table_stride_1
+                The uniform stride of the first table
+            table_stride_2
+                The uniform stride of the second table
+            check_frequency
+                The overflow check frequency
+            """
+            raise NotImplementedError("This atomic model doesn't support compression!")
+
+        @classmethod
+        def get_model(cls, model_params: dict) -> "BaseBaseModel":
+            """Get the model by the parameters.
+
+            By default, all the parameters are directly passed to the constructor.
+            If not, override this method.
+
+            Parameters
+            ----------
+            model_params : dict
+                The model parameters
+
+            Returns
+            -------
+            BaseBaseModel
+                The model
+            """
+            model_params_old = model_params.copy()
+            model_params = model_params.copy()
+            model_params.pop("type", None)
+            model = cls(**model_params)
+            model.model_def_script = json.dumps(model_params_old)
+            return model
+
+    return BaseBaseModel
+
+
+class BaseModel(make_base_model()):
+    """Base class for final exported model that will be directly used for inference.
+
+    The class defines some abstractmethods that will be directly called by the
+    inference interface. If the final model class inherbits some of those methods
+    from other classes, `BaseModel` should be inherited as the last class to ensure
+    the correct method resolution order.
+
+    This class is for the DPModel backend.
+
+    See Also
+    --------
+    deepmd.dpmodel.model.base_model.BaseBaseModel
+        Backend-independent BaseModel class.
+    """
+
+    pass

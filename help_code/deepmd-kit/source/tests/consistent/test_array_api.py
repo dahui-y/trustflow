@@ -1,0 +1,597 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
+import sys
+import unittest
+from unittest.mock import (
+    patch,
+)
+
+import array_api_compat
+import numpy as np
+
+from deepmd.dpmodel.array_api import (
+    _xp_einsum_fallback,
+    xp_add_at,
+    xp_asarray_nodetach,
+    xp_bincount,
+    xp_einsum,
+    xp_maximum_at,
+    xp_scatter_sum,
+    xp_setitem_at,
+    xp_sigmoid,
+    xp_uniform,
+)
+from deepmd.dpmodel.common import (
+    to_numpy_array,
+)
+
+from .common import (
+    INSTALLED_ARRAY_API_STRICT,
+    INSTALLED_JAX,
+    INSTALLED_PT,
+    INSTALLED_TF2,
+)
+
+if INSTALLED_PT:
+    import torch
+
+    from deepmd.pt_expt.utils.env import (
+        DEVICE,
+    )
+
+if INSTALLED_JAX:
+    from deepmd.jax.env import (
+        jnp,
+    )
+
+if INSTALLED_ARRAY_API_STRICT:
+    import array_api_strict as xp
+
+if INSTALLED_TF2:
+    from deepmd._vendors import ndtensorflow as tnp
+
+
+class TestArrayConversion(unittest.TestCase):
+    @unittest.skipUnless(INSTALLED_PT, "PyTorch is not installed")
+    def test_torch_parameter_requires_grad(self) -> None:
+        param = torch.nn.Parameter(
+            torch.tensor([1.0, 2.0], dtype=torch.float64, device=DEVICE)
+        )
+        self.assertTrue(param.requires_grad)
+        np.testing.assert_allclose(
+            to_numpy_array(param), np.array([1.0, 2.0], dtype=np.float64)
+        )
+        self.assertTrue(param.requires_grad)
+        self.assertEqual(param.device, DEVICE)
+
+    @unittest.skipUnless(INSTALLED_PT, "PyTorch is not installed")
+    def test_foreign_tensor_is_converted_to_numpy_namespace(self) -> None:
+        tensor = torch.tensor([1.0, 2.0], dtype=torch.float64, device=DEVICE)
+        numpy_namespace = array_api_compat.array_namespace(np.empty(0))
+
+        # A CUDA tensor rejects the direct NumPy protocol. Simulate that
+        # boundary on CPU so the device-to-host fallback is exercised on every
+        # platform.
+        with patch.object(
+            torch.Tensor,
+            "numpy",
+            side_effect=TypeError("direct conversion is unavailable"),
+        ):
+            converted = xp_asarray_nodetach(numpy_namespace, tensor)
+
+        self.assertIsInstance(converted, np.ndarray)
+        np.testing.assert_allclose(converted, np.array([1.0, 2.0]))
+
+    @unittest.skipUnless(INSTALLED_PT, "PyTorch is not installed")
+    def test_native_tensor_keeps_its_autograd_graph(self) -> None:
+        tensor = torch.nn.Parameter(
+            torch.tensor([1.0, 2.0], dtype=torch.float64, device=DEVICE)
+        )
+        torch_namespace = array_api_compat.array_namespace(tensor)
+
+        converted = xp_asarray_nodetach(torch_namespace, tensor)
+
+        self.assertIs(converted, tensor)
+        self.assertTrue(converted.requires_grad)
+
+    @unittest.skipUnless(INSTALLED_PT, "PyTorch is not installed")
+    def test_native_tensor_moves_to_a_requested_device(self) -> None:
+        """A requested device is honoured, and the move keeps the graph.
+
+        Model buffers and inputs normally travel together, so this is a no-op.
+        Tracing is the exception: a CPU export of a CUDA-resident model runs
+        CPU inputs through a module whose buffers stayed on the device, and
+        ignoring the request there surfaces as a fake-tensor device error far
+        downstream of the constant that caused it.
+        """
+        tensor = torch.nn.Parameter(
+            torch.tensor([1.0, 2.0], dtype=torch.float64, device=DEVICE)
+        )
+        torch_namespace = array_api_compat.array_namespace(tensor)
+
+        same = xp_asarray_nodetach(
+            torch_namespace, tensor, device=array_api_compat.device(tensor)
+        )
+        self.assertIs(same, tensor)
+
+        other = torch.device("cpu" if DEVICE.type == "cuda" else "meta")
+        moved = xp_asarray_nodetach(torch_namespace, tensor, device=other)
+        self.assertEqual(moved.device.type, other.type)
+        self.assertTrue(moved.requires_grad)
+
+
+class TestXpMaximumAtConsistent(unittest.TestCase):
+    """Test maximum-at identities that differ between backend primitives."""
+
+    @unittest.skipUnless(INSTALLED_TF2, "TensorFlow is not installed")
+    def test_tf_preserves_all_negative_infinity_segment(self) -> None:
+        x = tnp.asarray(np.full(2, -np.inf, dtype=np.float64))
+        indices = tnp.asarray(np.array([0, 0], dtype=np.int64))
+        values = tnp.asarray(np.array([-np.inf, -np.inf], dtype=np.float64))
+
+        result = to_numpy_array(xp_maximum_at(x, indices, values))
+
+        self.assertTrue(np.isneginf(result[0]))
+        self.assertTrue(np.isneginf(result[1]))
+
+
+class TestXpScatterSumConsistent(unittest.TestCase):
+    """Test xp_scatter_sum consistency across backends."""
+
+    def setUp(self) -> None:
+        # Reference using NumPy (via clone and scatter_add simulation)
+        self.input_np = np.zeros((3, 5))
+        self.dim = 0
+        self.index_np = np.array([[0, 1, 2, 0, 0]])
+        self.src_np = np.ones((1, 5))
+        # Manually compute reference for scatter_sum
+        self.ref = self.input_np.copy()
+        for i in range(self.index_np.shape[0]):
+            for j in range(self.index_np.shape[1]):
+                idx = self.index_np[i, j]
+                self.ref[idx, j] += self.src_np[i, j]
+
+    @unittest.skipUnless(INSTALLED_PT, "PyTorch is not installed")
+    def test_pt_consistent_with_ref(self) -> None:
+        input_pt = torch.from_numpy(self.input_np)
+        index_pt = torch.from_numpy(self.index_np).long()
+        src_pt = torch.from_numpy(self.src_np)
+        result = xp_scatter_sum(input_pt, self.dim, index_pt, src_pt)
+        # Verify original tensor is unchanged (non-mutating)
+        np.testing.assert_allclose(self.input_np, to_numpy_array(input_pt), atol=1e-10)
+        # Verify result matches reference
+        np.testing.assert_allclose(self.ref, to_numpy_array(result), atol=1e-10)
+
+    @unittest.skipUnless(INSTALLED_JAX, "JAX is not installed")
+    def test_jax_consistent_with_ref(self) -> None:
+        input_jax = jnp.array(self.input_np)
+        index_jax = jnp.array(self.index_np)
+        src_jax = jnp.array(self.src_np)
+        result = xp_scatter_sum(input_jax, self.dim, index_jax, src_jax)
+        np.testing.assert_allclose(self.ref, to_numpy_array(result), atol=1e-10)
+
+    @unittest.skipUnless(
+        INSTALLED_ARRAY_API_STRICT, "array_api_strict is not installed"
+    )
+    @unittest.skipUnless(
+        sys.version_info >= (3, 9), "array_api_strict doesn't support Python<=3.8"
+    )
+    def test_array_api_strict_consistent_with_ref(self) -> None:
+        input_xp = xp.asarray(self.input_np)
+        index_xp = xp.asarray(self.index_np)
+        src_xp = xp.asarray(self.src_np)
+        result = xp_scatter_sum(input_xp, self.dim, index_xp, src_xp)
+        np.testing.assert_allclose(self.ref, to_numpy_array(result), atol=1e-10)
+
+
+class TestXpAddAtConsistent(unittest.TestCase):
+    """Test xp_add_at consistency across backends."""
+
+    def setUp(self) -> None:
+        self.x_np = np.zeros((5, 3))
+        self.indices_np = np.array([0, 1, 1, 3])
+        self.values_np = np.ones((4, 3))
+        # Reference using NumPy
+        self.ref = self.x_np.copy()
+        np.add.at(self.ref, self.indices_np, self.values_np)
+
+    def test_numpy_consistent_with_ref(self) -> None:
+        x = self.x_np.copy()
+        result = xp_add_at(x, self.indices_np, self.values_np)
+        np.testing.assert_allclose(self.ref, result, atol=1e-10)
+
+    @unittest.skipUnless(INSTALLED_PT, "PyTorch is not installed")
+    def test_pt_consistent_with_ref(self) -> None:
+        x_pt = torch.from_numpy(self.x_np)
+        indices_pt = torch.from_numpy(self.indices_np).long()
+        values_pt = torch.from_numpy(self.values_np)
+        result = xp_add_at(x_pt, indices_pt, values_pt)
+        # Verify original tensor is unchanged (non-mutating)
+        np.testing.assert_allclose(self.x_np, to_numpy_array(x_pt), atol=1e-10)
+        # Verify result matches reference
+        np.testing.assert_allclose(self.ref, to_numpy_array(result), atol=1e-10)
+
+    @unittest.skipUnless(INSTALLED_JAX, "JAX is not installed")
+    def test_jax_consistent_with_ref(self) -> None:
+        x_jax = jnp.array(self.x_np)
+        indices_jax = jnp.array(self.indices_np)
+        values_jax = jnp.array(self.values_np)
+        result = xp_add_at(x_jax, indices_jax, values_jax)
+        np.testing.assert_allclose(self.ref, to_numpy_array(result), atol=1e-10)
+
+    @unittest.skipUnless(
+        INSTALLED_ARRAY_API_STRICT, "array_api_strict is not installed"
+    )
+    @unittest.skipUnless(
+        sys.version_info >= (3, 9), "array_api_strict doesn't support Python<=3.8"
+    )
+    def test_array_api_strict_consistent_with_ref(self) -> None:
+        x_xp = xp.asarray(self.x_np)
+        indices_xp = xp.asarray(self.indices_np)
+        values_xp = xp.asarray(self.values_np)
+        result = xp_add_at(x_xp, indices_xp, values_xp)
+        np.testing.assert_allclose(self.ref, to_numpy_array(result), atol=1e-10)
+
+
+class TestXpBincountConsistent(unittest.TestCase):
+    """Test xp_bincount consistency across backends."""
+
+    def setUp(self) -> None:
+        self.x_np = np.array([0, 1, 1, 3, 2, 1, 7])
+        self.ref = np.bincount(self.x_np)
+
+    def test_numpy_consistent_with_ref(self) -> None:
+        result = xp_bincount(self.x_np)
+        np.testing.assert_equal(self.ref, result)
+
+    @unittest.skipUnless(INSTALLED_PT, "PyTorch is not installed")
+    def test_pt_consistent_with_ref(self) -> None:
+        x_pt = torch.from_numpy(self.x_np)
+        result = xp_bincount(x_pt)
+        np.testing.assert_equal(self.ref, to_numpy_array(result))
+
+    @unittest.skipUnless(INSTALLED_JAX, "JAX is not installed")
+    def test_jax_consistent_with_ref(self) -> None:
+        x_jax = jnp.array(self.x_np)
+        result = xp_bincount(x_jax)
+        np.testing.assert_equal(self.ref, to_numpy_array(result))
+
+    @unittest.skipUnless(
+        INSTALLED_ARRAY_API_STRICT, "array_api_strict is not installed"
+    )
+    @unittest.skipUnless(
+        sys.version_info >= (3, 9), "array_api_strict doesn't support Python<=3.8"
+    )
+    def test_array_api_strict_consistent_with_ref(self) -> None:
+        x_xp = xp.asarray(self.x_np)
+        result = xp_bincount(x_xp)
+        np.testing.assert_equal(self.ref, to_numpy_array(result))
+
+
+class TestXpBincountWithWeightsConsistent(unittest.TestCase):
+    """Test xp_bincount with weights consistency across backends."""
+
+    def setUp(self) -> None:
+        self.x_np = np.array([0, 1, 1, 3, 2, 1, 7])
+        self.weights_np = np.array([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7])
+        self.ref = np.bincount(self.x_np, weights=self.weights_np)
+
+    def test_numpy_consistent_with_ref(self) -> None:
+        result = xp_bincount(self.x_np, weights=self.weights_np)
+        np.testing.assert_allclose(self.ref, result, atol=1e-10)
+
+    @unittest.skipUnless(INSTALLED_PT, "PyTorch is not installed")
+    def test_pt_consistent_with_ref(self) -> None:
+        x_pt = torch.from_numpy(self.x_np)
+        weights_pt = torch.from_numpy(self.weights_np)
+        result = xp_bincount(x_pt, weights=weights_pt)
+        np.testing.assert_allclose(self.ref, to_numpy_array(result), atol=1e-10)
+
+    @unittest.skipUnless(INSTALLED_JAX, "JAX is not installed")
+    def test_jax_consistent_with_ref(self) -> None:
+        x_jax = jnp.array(self.x_np)
+        weights_jax = jnp.array(self.weights_np)
+        result = xp_bincount(x_jax, weights=weights_jax)
+        np.testing.assert_allclose(self.ref, to_numpy_array(result), atol=1e-10)
+
+    @unittest.skipUnless(
+        INSTALLED_ARRAY_API_STRICT, "array_api_strict is not installed"
+    )
+    @unittest.skipUnless(
+        sys.version_info >= (3, 9), "array_api_strict doesn't support Python<=3.8"
+    )
+    def test_array_api_strict_consistent_with_ref(self) -> None:
+        x_xp = xp.asarray(self.x_np)
+        weights_xp = xp.asarray(self.weights_np)
+        result = xp_bincount(x_xp, weights=weights_xp)
+        np.testing.assert_allclose(self.ref, to_numpy_array(result), atol=1e-10)
+
+
+class TestXpBincountWithMinlengthConsistent(unittest.TestCase):
+    """Test xp_bincount with minlength consistency across backends."""
+
+    def setUp(self) -> None:
+        self.x_np = np.array([0, 1, 1, 3])
+        self.minlength = 10
+        self.ref = np.bincount(self.x_np, minlength=self.minlength)
+
+    def test_numpy_consistent_with_ref(self) -> None:
+        result = xp_bincount(self.x_np, minlength=self.minlength)
+        np.testing.assert_equal(self.ref, result)
+
+    @unittest.skipUnless(INSTALLED_PT, "PyTorch is not installed")
+    def test_pt_consistent_with_ref(self) -> None:
+        x_pt = torch.from_numpy(self.x_np)
+        result = xp_bincount(x_pt, minlength=self.minlength)
+        np.testing.assert_equal(self.ref, to_numpy_array(result))
+
+    @unittest.skipUnless(INSTALLED_JAX, "JAX is not installed")
+    def test_jax_consistent_with_ref(self) -> None:
+        x_jax = jnp.array(self.x_np)
+        result = xp_bincount(x_jax, minlength=self.minlength)
+        np.testing.assert_equal(self.ref, to_numpy_array(result))
+
+    @unittest.skipUnless(
+        INSTALLED_ARRAY_API_STRICT, "array_api_strict is not installed"
+    )
+    @unittest.skipUnless(
+        sys.version_info >= (3, 9), "array_api_strict doesn't support Python<=3.8"
+    )
+    def test_array_api_strict_consistent_with_ref(self) -> None:
+        x_xp = xp.asarray(self.x_np)
+        result = xp_bincount(x_xp, minlength=self.minlength)
+        np.testing.assert_equal(self.ref, to_numpy_array(result))
+
+
+class TestXpSigmoidConsistent(unittest.TestCase):
+    """Test xp_sigmoid consistency across backends."""
+
+    def setUp(self) -> None:
+        self.x_np = np.array([-2.0, -1.0, 0.0, 1.0, 2.0])
+        # Reference using NumPy sigmoid
+        self.ref = 1 / (1 + np.exp(-self.x_np))
+
+    def test_numpy_consistent_with_ref(self) -> None:
+        result = xp_sigmoid(self.x_np)
+        np.testing.assert_allclose(self.ref, result, atol=1e-10)
+
+    @unittest.skipUnless(INSTALLED_PT, "PyTorch is not installed")
+    def test_pt_consistent_with_ref(self) -> None:
+        x_pt = torch.from_numpy(self.x_np)
+        result = xp_sigmoid(x_pt)
+        np.testing.assert_allclose(self.ref, to_numpy_array(result), atol=1e-10)
+
+    @unittest.skipUnless(INSTALLED_JAX, "JAX is not installed")
+    def test_jax_consistent_with_ref(self) -> None:
+        x_jax = jnp.array(self.x_np)
+        result = xp_sigmoid(x_jax)
+        np.testing.assert_allclose(self.ref, to_numpy_array(result), atol=1e-10)
+
+    @unittest.skipUnless(
+        INSTALLED_ARRAY_API_STRICT, "array_api_strict is not installed"
+    )
+    @unittest.skipUnless(
+        sys.version_info >= (3, 9), "array_api_strict doesn't support Python<=3.8"
+    )
+    def test_array_api_strict_consistent_with_ref(self) -> None:
+        x_xp = xp.asarray(self.x_np)
+        result = xp_sigmoid(x_xp)
+        np.testing.assert_allclose(self.ref, to_numpy_array(result), atol=1e-10)
+
+
+class TestXpSetitemAtConsistent(unittest.TestCase):
+    """Test xp_setitem_at consistency across backends."""
+
+    def setUp(self) -> None:
+        self.x_np = np.zeros((5, 3))
+        self.mask_np = np.array([True, False, True, False, True])
+        self.values_np = np.ones((3, 3))
+        # Reference using NumPy
+        self.ref = self.x_np.copy()
+        self.ref[self.mask_np] = self.values_np
+
+    def test_numpy_consistent_with_ref(self) -> None:
+        x = self.x_np.copy()
+        result = xp_setitem_at(x, self.mask_np, self.values_np)
+        np.testing.assert_allclose(self.ref, result, atol=1e-10)
+
+    @unittest.skipUnless(INSTALLED_PT, "PyTorch is not installed")
+    def test_pt_consistent_with_ref(self) -> None:
+        x_pt = torch.from_numpy(self.x_np)
+        mask_pt = torch.from_numpy(self.mask_np)
+        values_pt = torch.from_numpy(self.values_np)
+        result = xp_setitem_at(x_pt, mask_pt, values_pt)
+        # Verify original tensor is unchanged (non-mutating)
+        np.testing.assert_allclose(self.x_np, to_numpy_array(x_pt), atol=1e-10)
+        # Verify result matches reference
+        np.testing.assert_allclose(self.ref, to_numpy_array(result), atol=1e-10)
+
+    @unittest.skipUnless(INSTALLED_JAX, "JAX is not installed")
+    def test_jax_consistent_with_ref(self) -> None:
+        x_jax = jnp.array(self.x_np)
+        mask_jax = jnp.array(self.mask_np)
+        values_jax = jnp.array(self.values_np)
+        result = xp_setitem_at(x_jax, mask_jax, values_jax)
+        np.testing.assert_allclose(self.ref, to_numpy_array(result), atol=1e-10)
+
+    @unittest.skipUnless(
+        INSTALLED_ARRAY_API_STRICT, "array_api_strict is not installed"
+    )
+    @unittest.skipUnless(
+        sys.version_info >= (3, 9), "array_api_strict doesn't support Python<=3.8"
+    )
+    def test_array_api_strict_consistent_with_ref(self) -> None:
+        x_xp = xp.asarray(self.x_np)
+        mask_xp = xp.asarray(self.mask_np)
+        values_xp = xp.asarray(self.values_np)
+        result = xp_setitem_at(x_xp, mask_xp, values_xp)
+        np.testing.assert_allclose(self.ref, to_numpy_array(result), atol=1e-10)
+
+    @unittest.skipUnless(INSTALLED_TF2, "TensorFlow 2 is not installed")
+    def test_tf2_consistent_with_ref(self) -> None:
+        x_tf2 = tnp.asarray(self.x_np)
+        mask_tf2 = tnp.asarray(self.mask_np)
+        values_tf2 = tnp.asarray(self.values_np)
+        result = xp_setitem_at(x_tf2, mask_tf2, values_tf2)
+        np.testing.assert_allclose(self.ref, to_numpy_array(result), atol=1e-10)
+
+    @unittest.skipUnless(INSTALLED_TF2, "TensorFlow 2 is not installed")
+    def test_tf2_full_rank_mask_consistent_with_ref(self) -> None:
+        x_np = np.zeros((1, 6, 10), dtype=np.int64)
+        mask_np = np.zeros((1, 6, 10), dtype=bool)
+        mask_np[:, :, :5] = True
+        values_np = np.arange(np.count_nonzero(mask_np), dtype=np.int64)
+        ref = x_np.copy()
+        ref[mask_np] = values_np
+
+        result = xp_setitem_at(
+            tnp.asarray(x_np),
+            tnp.asarray(mask_np),
+            tnp.asarray(values_np),
+        )
+        np.testing.assert_allclose(ref, to_numpy_array(result), atol=1e-10)
+
+
+class TestXpUniform(unittest.TestCase):
+    """Each backend draws with its own generator, on the reference device."""
+
+    @unittest.skipUnless(INSTALLED_PT, "PyTorch is not installed")
+    def test_pt_replays_under_torch_seed(self) -> None:
+        like = torch.zeros(7, dtype=torch.float64, device=DEVICE)
+        torch.manual_seed(4321)
+        a = xp_uniform(like, 512, 0.0, 2.0 * np.pi)
+        torch.manual_seed(4321)
+        b = xp_uniform(like, 512, 0.0, 2.0 * np.pi)
+        torch.manual_seed(1234)
+        c = xp_uniform(like, 512, 0.0, 2.0 * np.pi)
+
+        assert a.shape == (512,)
+        assert a.dtype == like.dtype
+        assert a.device.type == like.device.type
+        torch.testing.assert_close(a, b, rtol=0.0, atol=0.0)
+        # anti-vacuity: a constant would satisfy the replay check alone
+        assert not torch.allclose(a, c)
+        assert float(a.min()) >= 0.0
+        assert float(a.max()) < 2.0 * np.pi
+
+    def test_numpy_fallback_replays_under_the_project_seed(self) -> None:
+        """The fallback uses deepmd's seeded generator, not a fresh one."""
+        from deepmd.utils import random as dp_random
+
+        like = np.zeros(3, dtype=np.float64)
+        dp_random.seed(777)
+        a = xp_uniform(like, 64, -1.0, 1.0)
+        dp_random.seed(777)
+        b = xp_uniform(like, 64, -1.0, 1.0)
+        dp_random.seed(778)
+        c = xp_uniform(like, 64, -1.0, 1.0)
+
+        assert a.shape == (64,)
+        assert a.dtype == like.dtype
+        np.testing.assert_array_equal(a, b)
+        assert not np.allclose(a, c)
+        assert a.min() >= -1.0
+        assert a.max() < 1.0
+
+
+class TestXpEinsumConsistent(unittest.TestCase):
+    """Test xp_einsum consistency across backends.
+
+    The contraction ``"bfi,ifo->bfo"`` is the per-focus projection the DPA4
+    descriptor evaluates in several places. It is dispatched to each backend's
+    native ``einsum`` where one exists, which is what lets the backend choose
+    the execution order; the array-API fallback expresses the same contraction
+    as a batched matmul over the shared focus label.
+    """
+
+    def setUp(self) -> None:
+        rng = np.random.default_rng(20260825)
+        # (rows, batch, contracted) and (contracted, batch, cols)
+        self.lhs_np = rng.normal(size=(7, 3, 5))
+        self.rhs_np = rng.normal(size=(5, 3, 4))
+        self.ref = np.einsum("bfi,ifo->bfo", self.lhs_np, self.rhs_np)
+
+    def test_numpy_consistent_with_ref(self) -> None:
+        result = xp_einsum("bfi,ifo->bfo", self.lhs_np, self.rhs_np)
+        np.testing.assert_allclose(self.ref, to_numpy_array(result), atol=1e-12)
+
+    @unittest.skipUnless(INSTALLED_PT, "PyTorch is not installed")
+    def test_pt_consistent_with_ref(self) -> None:
+        result = xp_einsum(
+            "bfi,ifo->bfo",
+            torch.from_numpy(self.lhs_np),
+            torch.from_numpy(self.rhs_np),
+        )
+        np.testing.assert_allclose(self.ref, to_numpy_array(result), atol=1e-12)
+
+    @unittest.skipUnless(INSTALLED_JAX, "JAX is not installed")
+    def test_jax_consistent_with_ref(self) -> None:
+        result = xp_einsum(
+            "bfi,ifo->bfo", jnp.array(self.lhs_np), jnp.array(self.rhs_np)
+        )
+        np.testing.assert_allclose(self.ref, to_numpy_array(result), atol=1e-6)
+
+    @unittest.skipUnless(
+        INSTALLED_ARRAY_API_STRICT, "array_api_strict is not installed"
+    )
+    @unittest.skipUnless(
+        sys.version_info >= (3, 9), "array_api_strict doesn't support Python<=3.8"
+    )
+    def test_array_api_strict_consistent_with_ref(self) -> None:
+        result = xp_einsum(
+            "bfi,ifo->bfo", xp.asarray(self.lhs_np), xp.asarray(self.rhs_np)
+        )
+        np.testing.assert_allclose(self.ref, to_numpy_array(result), atol=1e-12)
+
+    def test_fallback_matches_the_native_contraction(self) -> None:
+        """The fallback is the reference the non-native namespaces rely on."""
+        result = _xp_einsum_fallback("bfi,ifo->bfo", self.lhs_np, self.rhs_np)
+        np.testing.assert_allclose(self.ref, to_numpy_array(result), atol=1e-12)
+        # Label names carry no meaning beyond their positions.
+        renamed = _xp_einsum_fallback("efi,ifo->efo", self.lhs_np, self.rhs_np)
+        np.testing.assert_allclose(self.ref, to_numpy_array(renamed), atol=1e-12)
+
+    def test_fallback_handles_the_plain_matmul(self) -> None:
+        rng = np.random.default_rng(7)
+        lhs, rhs = rng.normal(size=(6, 4)), rng.normal(size=(4, 9))
+        result = _xp_einsum_fallback("ij,jk->ik", lhs, rhs)
+        np.testing.assert_allclose(lhs @ rhs, to_numpy_array(result), atol=1e-12)
+
+    def test_implicit_form_is_rejected(self) -> None:
+        """An implicit output would be ambiguous to the fallback."""
+        with self.assertRaises(ValueError):
+            xp_einsum("bfi,ifo", self.lhs_np, self.rhs_np)
+
+    def test_fallback_reorders_the_output(self) -> None:
+        """The output order is part of the specification, not of the operands."""
+        result = _xp_einsum_fallback("bfi,ifo->bof", self.lhs_np, self.rhs_np)
+        np.testing.assert_allclose(
+            np.einsum("bfi,ifo->bof", self.lhs_np, self.rhs_np),
+            to_numpy_array(result),
+            atol=1e-12,
+        )
+
+    def test_fallback_batches_over_several_labels(self) -> None:
+        """The per-degree, per-focus projection shares two batch labels."""
+        rng = np.random.default_rng(31)
+        lhs = rng.normal(size=(6, 4, 2, 5))  # (N, D, F, Cin)
+        rhs = rng.normal(size=(4, 5, 2, 3))  # (D, Cin, F, Cout)
+        result = _xp_einsum_fallback("ndfi,difo->ndfo", lhs, rhs)
+        np.testing.assert_allclose(
+            np.einsum("ndfi,difo->ndfo", lhs, rhs),
+            to_numpy_array(result),
+            atol=1e-12,
+        )
+
+    def test_fallback_rejects_what_it_cannot_express(self) -> None:
+        """A contraction outside the implemented shape must not be approximated.
+
+        A label dropped from the output would need a reduction, a repeated
+        label a diagonal, and more than two operands a contraction path;
+        none of the three occurs in this codebase.
+        """
+        for subscripts in ("abc,def->abf", "ab,bc,cd->ad"):
+            with self.assertRaises(ValueError):
+                _xp_einsum_fallback(subscripts, self.lhs_np, self.rhs_np)
+        square = np.eye(4)
+        with self.assertRaises(ValueError):
+            _xp_einsum_fallback("ii,ij->ij", square, square)

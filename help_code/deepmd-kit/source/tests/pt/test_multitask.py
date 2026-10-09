@@ -1,0 +1,548 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
+import json
+import math
+import os
+import shutil
+import unittest
+from copy import (
+    deepcopy,
+)
+from pathlib import (
+    Path,
+)
+from unittest.mock import (
+    patch,
+)
+
+import torch
+
+from deepmd.pt.entrypoints.main import (
+    get_trainer,
+)
+from deepmd.pt.utils.finetune import (
+    get_finetune_rules,
+)
+from deepmd.pt.utils.multi_task import (
+    preprocess_shared_params,
+)
+from deepmd.utils.argcheck import (
+    normalize,
+)
+from deepmd.utils.compat import (
+    update_deepmd_input,
+)
+
+from .model.test_permutation import (
+    model_dpa1,
+    model_dpa2,
+    model_dpa2tebd,
+    model_dpa3,
+    model_se_e2_a,
+)
+
+
+def setUpModule() -> None:
+    global multitask_template
+    multitask_template_json = str(Path(__file__).parent / "water/multitask.json")
+    with open(multitask_template_json) as f:
+        multitask_template = json.load(f)
+
+    global multitask_sharefit_template
+    multitask_sharefit_template_json = str(
+        Path(__file__).parent / "water/multitask_sharefit.json"
+    )
+    with open(multitask_sharefit_template_json) as f:
+        multitask_sharefit_template = json.load(f)
+
+
+class MultiTaskTrainTest:
+    def test_multitask_train(self) -> None:
+        # test multitask training
+        self.config = update_deepmd_input(self.config, warning=True)
+        self.config = normalize(self.config, multi_task=True)
+        self.share_fitting = getattr(self, "share_fitting", False)
+        trainer = get_trainer(deepcopy(self.config), shared_links=self.shared_links)
+        trainer.run()
+
+        # check lcurve.out columns for all model keys
+        with open("lcurve.out") as f:
+            lines = f.readlines()
+        header_line = lines[0]
+        header_cols = header_line.strip().lstrip("#").split()
+        # each model key should appear in header columns
+        model_keys = list(self.config["training"]["model_prob"].keys())
+        for mk in model_keys:
+            cols_for_model = [c for c in header_cols if mk in c]
+            self.assertGreater(
+                len(cols_for_model), 0, f"No lcurve columns found for {mk}"
+            )
+        # data line column count should match header
+        data_lines = [l for l in lines if not l.startswith("#")]
+        self.assertGreater(len(data_lines), 0, "No data lines in lcurve.out")
+        data_cols = data_lines[0].split()
+        self.assertEqual(len(data_cols), len(header_cols))
+
+        # check model keys
+        self.assertEqual(len(trainer.wrapper.model), 2)
+        self.assertIn("model_1", trainer.wrapper.model)
+        self.assertIn("model_2", trainer.wrapper.model)
+
+        # check shared parameters
+        multi_state_dict = trainer.wrapper.model.state_dict()
+        for state_key in multi_state_dict:
+            if "model_1" in state_key:
+                self.assertIn(state_key.replace("model_1", "model_2"), multi_state_dict)
+            if "model_2" in state_key:
+                self.assertIn(state_key.replace("model_2", "model_1"), multi_state_dict)
+            if ("model_1.atomic_model.descriptor" in state_key) or (
+                self.share_fitting
+                and "model_1.atomic_model.fitting_net" in state_key
+                and "fitting_net.bias_atom_e" not in state_key
+                and "fitting_net.case_embd" not in state_key
+            ):
+                torch.testing.assert_close(
+                    multi_state_dict[state_key],
+                    multi_state_dict[state_key.replace("model_1", "model_2")],
+                )
+
+        # test multitask fine-tuning
+        # add model_3
+        self.origin_config["model"]["model_dict"]["model_3"] = deepcopy(
+            self.origin_config["model"]["model_dict"]["model_2"]
+        )
+        self.origin_config["loss_dict"]["model_3"] = deepcopy(
+            self.origin_config["loss_dict"]["model_2"]
+        )
+        self.origin_config["training"]["model_prob"]["model_3"] = deepcopy(
+            self.origin_config["training"]["model_prob"]["model_2"]
+        )
+        self.origin_config["training"]["data_dict"]["model_3"] = deepcopy(
+            self.origin_config["training"]["data_dict"]["model_2"]
+        )
+        self.origin_config["training"]["data_dict"]["model_3"]["stat_file"] = (
+            self.origin_config["training"]["data_dict"]["model_3"]["stat_file"].replace(
+                "model_2", "model_3"
+            )
+        )
+
+        # add model_4
+        self.origin_config["model"]["model_dict"]["model_4"] = deepcopy(
+            self.origin_config["model"]["model_dict"]["model_2"]
+        )
+        self.origin_config["loss_dict"]["model_4"] = deepcopy(
+            self.origin_config["loss_dict"]["model_2"]
+        )
+        self.origin_config["training"]["model_prob"]["model_4"] = deepcopy(
+            self.origin_config["training"]["model_prob"]["model_2"]
+        )
+        self.origin_config["training"]["data_dict"]["model_4"] = deepcopy(
+            self.origin_config["training"]["data_dict"]["model_2"]
+        )
+        self.origin_config["training"]["data_dict"]["model_4"]["stat_file"] = (
+            self.origin_config["training"]["data_dict"]["model_4"]["stat_file"].replace(
+                "model_2", "model_4"
+            )
+        )
+
+        # set finetune rules
+        # model_1 resuming from model_1
+        # pass
+
+        # model_2 fine-tuning from model_2
+        self.origin_config["model"]["model_dict"]["model_2"]["finetune_head"] = (
+            "model_2"
+        )
+
+        # new model_3 fine-tuning from model_2
+        self.origin_config["model"]["model_dict"]["model_3"]["finetune_head"] = (
+            "model_2"
+        )
+
+        # new model_4 fine-tuning with randomly initialized fitting net
+        # pass
+
+        self.origin_config["model"], shared_links_finetune = preprocess_shared_params(
+            self.origin_config["model"]
+        )
+
+        finetune_model = self.config["training"].get("save_ckpt", "model.ckpt") + ".pt"
+        self.origin_config["model"], finetune_links = get_finetune_rules(
+            finetune_model,
+            self.origin_config["model"],
+        )
+        self.origin_config = update_deepmd_input(self.origin_config, warning=True)
+        self.origin_config = normalize(self.origin_config, multi_task=True)
+        trainer_finetune = get_trainer(
+            deepcopy(self.origin_config),
+            finetune_model=finetune_model,
+            shared_links=shared_links_finetune,
+            finetune_links=finetune_links,
+        )
+
+        # check parameters
+        multi_state_dict_finetuned = trainer_finetune.wrapper.model.state_dict()
+        for state_key in multi_state_dict_finetuned:
+            if "model_1" in state_key:
+                torch.testing.assert_close(
+                    multi_state_dict[state_key],
+                    multi_state_dict_finetuned[state_key],
+                )
+            elif "model_2" in state_key and "out_bias" not in state_key:
+                torch.testing.assert_close(
+                    multi_state_dict[state_key],
+                    multi_state_dict_finetuned[state_key],
+                )
+            elif "model_3" in state_key and "out_bias" not in state_key:
+                torch.testing.assert_close(
+                    multi_state_dict[state_key.replace("model_3", "model_2")],
+                    multi_state_dict_finetuned[state_key],
+                )
+            elif (
+                "model_4" in state_key
+                and "fitting_net" not in state_key
+                and "out_bias" not in state_key
+            ):
+                torch.testing.assert_close(
+                    multi_state_dict[state_key.replace("model_4", "model_2")],
+                    multi_state_dict_finetuned[state_key],
+                )
+
+        # check running
+        trainer_finetune.run()
+        self.tearDown()
+
+    def tearDown(self) -> None:
+        for f in os.listdir("."):
+            if f.startswith("model") and f.endswith(".pt"):
+                os.remove(f)
+            if f in ["lcurve.out"]:
+                os.remove(f)
+            if f in [self.stat_files]:
+                shutil.rmtree(f)
+
+
+class TestMultiTaskSeA(unittest.TestCase, MultiTaskTrainTest):
+    def setUp(self) -> None:
+        multitask_se_e2_a = deepcopy(multitask_template)
+        multitask_se_e2_a["model"]["shared_dict"]["my_descriptor"] = model_se_e2_a[
+            "descriptor"
+        ]
+        data_file = [str(Path(__file__).parent / "water/data/data_0")]
+        self.stat_files = "se_e2_a"
+        os.makedirs(self.stat_files, exist_ok=True)
+        self.config = multitask_se_e2_a
+        self.config["training"]["data_dict"]["model_1"]["training_data"]["systems"] = (
+            data_file
+        )
+        self.config["training"]["data_dict"]["model_1"]["validation_data"][
+            "systems"
+        ] = data_file
+        self.config["training"]["data_dict"]["model_1"]["stat_file"] = (
+            f"{self.stat_files}/model_1"
+        )
+        self.config["training"]["data_dict"]["model_2"]["training_data"]["systems"] = (
+            data_file
+        )
+        self.config["training"]["data_dict"]["model_2"]["validation_data"][
+            "systems"
+        ] = data_file
+        self.config["training"]["data_dict"]["model_2"]["stat_file"] = (
+            f"{self.stat_files}/model_2"
+        )
+        self.config["training"]["numb_steps"] = 1
+        self.config["training"]["save_freq"] = 1
+        self.origin_config = deepcopy(self.config)
+        self.config["model"], self.shared_links = preprocess_shared_params(
+            self.config["model"]
+        )
+
+    def test_filtered_tasks_share_retry_budget(self) -> None:
+        """All tasks share one retry budget when filtering invalid batches."""
+        config = deepcopy(self.config)
+        data_dict = config["training"]["data_dict"]
+        for task_data in data_dict.values():
+            task_data["training_data"]["min_pair_dist"] = 0.1
+        data_dict["model_1"]["training_data"]["systems"] = [
+            *data_dict["model_1"]["training_data"]["systems"],
+            str(Path(__file__).parent / "water/data/data_1"),
+        ]
+        config = update_deepmd_input(config, warning=False)
+        config = normalize(config, multi_task=True)
+        trainer = get_trainer(config, shared_links=self.shared_links)
+
+        loader_lengths = {
+            task_key: len(trainer.training_dataloader[task_key])
+            for task_key in trainer.model_keys
+        }
+        self.assertGreater(len(set(loader_lengths.values())), 1)
+        expected_attempts = max(loader_lengths.values())
+
+        for task_key in trainer.model_keys:
+            with self.subTest(task_key=task_key):
+                call_count = 0
+
+                def get_empty_data(
+                    is_train: bool = True,
+                    task_key: str = "Default",
+                ) -> tuple[dict, dict, dict]:
+                    nonlocal call_count
+                    call_count += 1
+                    return {}, {}, {}
+
+                trainer.get_data = get_empty_data
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    rf"after {expected_attempts} attempts",
+                ):
+                    trainer._next_training_batch(task_key)
+                self.assertEqual(call_count, expected_attempts)
+
+    def test_disp_avg_handles_unsampled_interval(self) -> None:
+        """Each task is unsampled in one interval; reporting consumes no batches."""
+        config = deepcopy(self.config)
+        config["training"]["numb_steps"] = 2
+        config["training"]["disp_freq"] = 1
+        config["training"]["disp_avg"] = True
+        config = update_deepmd_input(config, warning=True)
+        config = normalize(config, multi_task=True)
+        trainer = get_trainer(config, shared_links=self.shared_links)
+
+        with (
+            patch(
+                "deepmd.pt.train.training.dp_random.choice",
+                side_effect=[0, 1],
+            ),
+            patch.object(trainer, "get_data", wraps=trainer.get_data) as get_data,
+        ):
+            trainer.run()
+
+        training_tasks = [
+            call.kwargs.get("task_key", "Default")
+            for call in get_data.call_args_list
+            if call.kwargs.get("is_train", True)
+        ]
+        self.assertEqual(training_tasks, ["model_1", "model_2"])
+
+        with open("lcurve.out") as f:
+            lines = f.readlines()
+        header_lines = [line.split() for line in lines if line.startswith("#")]
+        data_lines = [line.split() for line in lines if not line.startswith("#")]
+        self.assertTrue(header_lines)
+        header_columns = header_lines[0][1:]
+        self.assertTrue(any("_val_" in column for column in header_columns))
+        for columns in data_lines:
+            self.assertEqual(len(columns), len(header_columns))
+        displayed_steps = [int(columns[0]) for columns in data_lines]
+        self.assertEqual(displayed_steps, [1, 2])
+        for row, sampled_task, unsampled_task in (
+            (data_lines[0], "model_1", "model_2"),
+            (data_lines[1], "model_2", "model_1"),
+        ):
+            sampled_index = header_columns.index(f"rmse_trn_{sampled_task}")
+            self.assertTrue(math.isfinite(float(row[sampled_index])))
+            for index, column in enumerate(header_columns):
+                if column.endswith(f"_trn_{unsampled_task}"):
+                    self.assertTrue(math.isnan(float(row[index])), column)
+
+    def tearDown(self) -> None:
+        MultiTaskTrainTest.tearDown(self)
+
+
+class TestMultiTaskSeASharefit(unittest.TestCase, MultiTaskTrainTest):
+    def setUp(self) -> None:
+        multitask_se_e2_a = deepcopy(multitask_sharefit_template)
+        multitask_se_e2_a["model"]["shared_dict"]["my_descriptor"] = model_se_e2_a[
+            "descriptor"
+        ]
+        data_file = [str(Path(__file__).parent / "water/data/data_0")]
+        self.stat_files = "se_e2_a_share_fit"
+        os.makedirs(self.stat_files, exist_ok=True)
+        self.config = multitask_se_e2_a
+        self.config["training"]["data_dict"]["model_1"]["training_data"]["systems"] = (
+            data_file
+        )
+        self.config["training"]["data_dict"]["model_1"]["validation_data"][
+            "systems"
+        ] = data_file
+        self.config["training"]["data_dict"]["model_1"]["stat_file"] = (
+            f"{self.stat_files}/model_1"
+        )
+        self.config["training"]["data_dict"]["model_2"]["training_data"]["systems"] = (
+            data_file
+        )
+        self.config["training"]["data_dict"]["model_2"]["validation_data"][
+            "systems"
+        ] = data_file
+        self.config["training"]["data_dict"]["model_2"]["stat_file"] = (
+            f"{self.stat_files}/model_2"
+        )
+        self.config["training"]["numb_steps"] = 1
+        self.config["training"]["save_freq"] = 1
+        self.origin_config = deepcopy(self.config)
+        self.config["model"], self.shared_links = preprocess_shared_params(
+            self.config["model"]
+        )
+        self.share_fitting = True
+
+    def tearDown(self) -> None:
+        MultiTaskTrainTest.tearDown(self)
+
+
+class TestMultiTaskDPA1(unittest.TestCase, MultiTaskTrainTest):
+    def setUp(self) -> None:
+        multitask_DPA1 = deepcopy(multitask_template)
+        multitask_DPA1["model"]["shared_dict"]["my_descriptor"] = model_dpa1[
+            "descriptor"
+        ]
+        data_file = [str(Path(__file__).parent / "water/data/data_0")]
+        self.stat_files = "DPA1"
+        os.makedirs(self.stat_files, exist_ok=True)
+        self.config = multitask_DPA1
+        self.config["training"]["data_dict"]["model_1"]["training_data"]["systems"] = (
+            data_file
+        )
+        self.config["training"]["data_dict"]["model_1"]["validation_data"][
+            "systems"
+        ] = data_file
+        self.config["training"]["data_dict"]["model_1"]["stat_file"] = (
+            f"{self.stat_files}/model_1"
+        )
+        self.config["training"]["data_dict"]["model_2"]["training_data"]["systems"] = (
+            data_file
+        )
+        self.config["training"]["data_dict"]["model_2"]["validation_data"][
+            "systems"
+        ] = data_file
+        self.config["training"]["data_dict"]["model_2"]["stat_file"] = (
+            f"{self.stat_files}/model_2"
+        )
+        self.config["training"]["numb_steps"] = 1
+        self.config["training"]["save_freq"] = 1
+        self.origin_config = deepcopy(self.config)
+        self.config["model"], self.shared_links = preprocess_shared_params(
+            self.config["model"]
+        )
+
+    def tearDown(self) -> None:
+        MultiTaskTrainTest.tearDown(self)
+
+
+class TestMultiTaskDPA2(unittest.TestCase, MultiTaskTrainTest):
+    def setUp(self) -> None:
+        multitask_DPA2 = deepcopy(multitask_template)
+        multitask_DPA2["model"]["shared_dict"]["my_descriptor"] = model_dpa2[
+            "descriptor"
+        ]
+        data_file = [str(Path(__file__).parent / "water/data/data_0")]
+        self.stat_files = "DPA2"
+        os.makedirs(self.stat_files, exist_ok=True)
+        self.config = multitask_DPA2
+        self.config["training"]["data_dict"]["model_1"]["training_data"]["systems"] = (
+            data_file
+        )
+        self.config["training"]["data_dict"]["model_1"]["validation_data"][
+            "systems"
+        ] = data_file
+        self.config["training"]["data_dict"]["model_1"]["stat_file"] = (
+            f"{self.stat_files}/model_1"
+        )
+        self.config["training"]["data_dict"]["model_2"]["training_data"]["systems"] = (
+            data_file
+        )
+        self.config["training"]["data_dict"]["model_2"]["validation_data"][
+            "systems"
+        ] = data_file
+        self.config["training"]["data_dict"]["model_2"]["stat_file"] = (
+            f"{self.stat_files}/model_2"
+        )
+        self.config["training"]["numb_steps"] = 1
+        self.config["training"]["save_freq"] = 1
+        self.origin_config = deepcopy(self.config)
+        self.config["model"], self.shared_links = preprocess_shared_params(
+            self.config["model"]
+        )
+
+    def tearDown(self) -> None:
+        MultiTaskTrainTest.tearDown(self)
+
+
+class TestMultiTaskDPA2Tebd(unittest.TestCase, MultiTaskTrainTest):
+    def setUp(self) -> None:
+        multitask_DPA2 = deepcopy(multitask_template)
+        multitask_DPA2["model"]["shared_dict"]["my_descriptor"] = model_dpa2tebd[
+            "descriptor"
+        ]
+        data_file = [str(Path(__file__).parent / "water/data/data_0")]
+        self.stat_files = "DPA2Tebd"
+        os.makedirs(self.stat_files, exist_ok=True)
+        self.config = multitask_DPA2
+        self.config["training"]["data_dict"]["model_1"]["training_data"]["systems"] = (
+            data_file
+        )
+        self.config["training"]["data_dict"]["model_1"]["validation_data"][
+            "systems"
+        ] = data_file
+        self.config["training"]["data_dict"]["model_1"]["stat_file"] = (
+            f"{self.stat_files}/model_1"
+        )
+        self.config["training"]["data_dict"]["model_2"]["training_data"]["systems"] = (
+            data_file
+        )
+        self.config["training"]["data_dict"]["model_2"]["validation_data"][
+            "systems"
+        ] = data_file
+        self.config["training"]["data_dict"]["model_2"]["stat_file"] = (
+            f"{self.stat_files}/model_2"
+        )
+        self.config["training"]["numb_steps"] = 1
+        self.config["training"]["save_freq"] = 1
+        self.origin_config = deepcopy(self.config)
+        self.config["model"], self.shared_links = preprocess_shared_params(
+            self.config["model"]
+        )
+
+    def tearDown(self) -> None:
+        MultiTaskTrainTest.tearDown(self)
+
+
+class TestMultiTaskDPA3(unittest.TestCase, MultiTaskTrainTest):
+    def setUp(self) -> None:
+        multitask_DPA3 = deepcopy(multitask_template)
+        multitask_DPA3["model"]["shared_dict"]["my_descriptor"] = model_dpa3[
+            "descriptor"
+        ]
+        data_file = [str(Path(__file__).parent / "water/data/data_0")]
+        self.stat_files = "DPA3"
+        os.makedirs(self.stat_files, exist_ok=True)
+        self.config = multitask_DPA3
+        self.config["training"]["data_dict"]["model_1"]["training_data"]["systems"] = (
+            data_file
+        )
+        self.config["training"]["data_dict"]["model_1"]["validation_data"][
+            "systems"
+        ] = data_file
+        self.config["training"]["data_dict"]["model_1"]["stat_file"] = (
+            f"{self.stat_files}/model_1"
+        )
+        self.config["training"]["data_dict"]["model_2"]["training_data"]["systems"] = (
+            data_file
+        )
+        self.config["training"]["data_dict"]["model_2"]["validation_data"][
+            "systems"
+        ] = data_file
+        self.config["training"]["data_dict"]["model_2"]["stat_file"] = (
+            f"{self.stat_files}/model_2"
+        )
+        self.config["training"]["numb_steps"] = 1
+        self.config["training"]["save_freq"] = 1
+        self.origin_config = deepcopy(self.config)
+        self.config["model"], self.shared_links = preprocess_shared_params(
+            self.config["model"]
+        )
+
+    def tearDown(self) -> None:
+        MultiTaskTrainTest.tearDown(self)
+
+
+if __name__ == "__main__":
+    unittest.main()

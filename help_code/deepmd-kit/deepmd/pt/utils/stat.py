@@ -1,0 +1,976 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
+import logging
+from collections import (
+    defaultdict,
+)
+from collections.abc import (
+    Callable,
+    Sequence,
+)
+from typing import (
+    Any,
+)
+
+import numpy as np
+import torch
+from torch.utils.data import (
+    DataLoader,
+)
+
+from deepmd.pt.utils import (
+    AtomExcludeMask,
+)
+from deepmd.pt.utils.auto_batch_size import (
+    AutoBatchSize,
+)
+from deepmd.pt.utils.utils import (
+    dict_to_device,
+    to_numpy_array,
+    to_torch_tensor,
+)
+from deepmd.utils.out_stat import (
+    ReduScanResult,
+    ReduStatAccumulator,
+    ReduStatScanner,
+    compute_stats_do_not_distinguish_types,
+    compute_stats_from_atomic,
+    compute_stats_from_redu,
+    get_redu_stat_scanner,
+)
+from deepmd.utils.path import (
+    DPPath,
+)
+from deepmd.utils.preset_out_bias import (
+    make_preset_out_bias,
+    override_assigned_bias,
+)
+from deepmd.utils.stat_file import (
+    load_output_stat_full_scan,
+    load_output_stats,
+    save_output_stat_full_scan,
+    save_output_stats,
+)
+
+log = logging.getLogger(__name__)
+
+# Re-export from dpmodel (backend-agnostic implementations)
+from deepmd.dpmodel.utils.stat import (
+    _restore_observed_type_from_file,
+    _save_observed_type_to_file,
+    collect_observed_types,
+    observed_types_from_counts,
+)
+
+__all__ = [
+    "_restore_observed_type_from_file",
+    "_save_observed_type_to_file",
+    "collect_observed_types",
+    "min_pair_dist_frame_mask",
+    "observed_types_from_counts",
+    "scan_redu_stats",
+    "select_batch_frames",
+]
+
+
+def min_pair_dist_frame_mask(
+    batch: dict[str, Any],
+    min_pair_dist: float,
+) -> torch.Tensor | None:
+    """
+    Return the valid-frame mask for a minimum pair-distance threshold.
+
+    Parameters
+    ----------
+    batch
+        Data batch containing frame-aligned tensors.
+    min_pair_dist
+        Minimum allowed pair distance in Å.
+
+    Returns
+    -------
+    torch.Tensor or None
+        Boolean mask with shape (nframes), or ``None`` when filtering is
+        disabled or the distance field is unavailable.
+    """
+    if min_pair_dist <= 0.0 or "min_pair_dist" not in batch:
+        return None
+    distances = batch["min_pair_dist"]
+    if not isinstance(distances, torch.Tensor):
+        return None
+    return distances.reshape(-1) >= float(min_pair_dist)
+
+
+def select_batch_frames(
+    batch: dict[str, Any],
+    frame_mask: torch.Tensor,
+) -> dict[str, Any]:
+    """
+    Select frame-aligned tensors from one data batch.
+
+    Parameters
+    ----------
+    batch
+        Data batch containing tensors and scalar metadata.
+    frame_mask
+        Boolean selection mask with shape (nframes).
+
+    Returns
+    -------
+    dict[str, Any]
+        Batch with every frame-aligned tensor sliced by ``frame_mask``.
+    """
+    nframes = frame_mask.shape[0]
+    selected: dict[str, Any] = {}
+    frame_keep = frame_mask.detach().cpu().tolist()
+    for key, value in batch.items():
+        if (
+            isinstance(value, torch.Tensor)
+            and value.ndim > 0
+            and value.shape[0] == nframes
+        ):
+            selected[key] = value[frame_mask]
+        elif isinstance(value, list) and len(value) == nframes:
+            selected[key] = [
+                item for item, keep in zip(value, frame_keep, strict=True) if keep
+            ]
+        else:
+            selected[key] = value
+    return selected
+
+
+def make_stat_input(
+    datasets: list[Any],
+    dataloaders: list[Any],
+    nbatches: int,
+    min_pair_dist: float = 0.0,
+) -> list[dict[str, Any]]:
+    """Pack data for statistics.
+
+    Parameters
+    ----------
+    datasets
+        Data systems to analyze.
+    dataloaders
+        One data loader for each system.
+    nbatches
+        Maximum number of valid batches collected from each system.
+    min_pair_dist
+        Minimum allowed pair distance in Å. Frames below the threshold are
+        excluded before statistics are accumulated.
+
+    Returns
+    -------
+    list[dict[str, Any]]
+        Packed statistics, one dictionary for each system that contributes at
+        least one valid frame.
+    """
+    lst = []
+    log.info("Packing data for statistics from %d systems", len(datasets))
+    for system_index in range(len(datasets)):
+        sys_stat = {}
+        with torch.device("cpu"):
+            dataloader = dataloaders[system_index]
+            dataloader_size = len(dataloader)
+            target_batches = min(nbatches, dataloader_size)
+            scan_limit = dataloader_size if min_pair_dist > 0.0 else target_batches
+            iterator = iter(dataloader)
+            accepted_batches = 0
+            scanned_batches = 0
+            while accepted_batches < target_batches and scanned_batches < scan_limit:
+                try:
+                    stat_data = next(iterator)
+                except StopIteration:
+                    iterator = iter(dataloader)
+                    try:
+                        stat_data = next(iterator)
+                    except StopIteration:
+                        break
+                scanned_batches += 1
+                frame_mask = min_pair_dist_frame_mask(stat_data, min_pair_dist)
+                if frame_mask is not None and not torch.any(frame_mask):
+                    continue
+                if frame_mask is not None:
+                    stat_data = select_batch_frames(stat_data, frame_mask)
+                accepted_batches += 1
+                if (
+                    "find_fparam" in stat_data
+                    and "fparam" in stat_data
+                    and stat_data["find_fparam"] == 0.0
+                ):
+                    # for model using default fparam
+                    stat_data.pop("fparam")
+                    stat_data.pop("find_fparam")
+                for dd in stat_data:
+                    if stat_data[dd] is None:
+                        sys_stat[dd] = None
+                    elif isinstance(stat_data[dd], torch.Tensor):
+                        if dd not in sys_stat:
+                            sys_stat[dd] = []
+                        sys_stat[dd].append(stat_data[dd])
+                    elif isinstance(stat_data[dd], np.float32):
+                        sys_stat[dd] = stat_data[dd]
+                    else:
+                        pass
+
+        if not sys_stat:
+            if min_pair_dist > 0.0:
+                log.info(
+                    "Skipping data system %d in statistics because no frame "
+                    "satisfies min_pair_dist=%s.",
+                    system_index,
+                    min_pair_dist,
+                )
+            else:
+                log.info(
+                    "Skipping data system %d in statistics because its data "
+                    "loader produced no batch.",
+                    system_index,
+                )
+            continue
+        for key in sys_stat:
+            if isinstance(sys_stat[key], np.float32):
+                pass
+            elif sys_stat[key] is None or sys_stat[key][0] is None:
+                sys_stat[key] = None
+            elif isinstance(sys_stat[key], list):
+                sys_stat[key] = torch.cat(sys_stat[key], dim=0)
+        dict_to_device(sys_stat)
+        lst.append(sys_stat)
+    return lst
+
+
+def _full_pass_loader(dataloader: Any) -> Any:
+    """Return a loader that covers the dataset once, whatever sampler it uses.
+
+    Training loaders may carry a distributed or weighted sampler, which would
+    hide part of the data from a scan that is meant to be exhaustive.
+    """
+    if dataloader.batch_size is None:
+        # a custom batch sampler owns the batching; leave it alone
+        return dataloader
+    with torch.device("cpu"):
+        return DataLoader(
+            dataloader.dataset,
+            batch_size=dataloader.batch_size,
+            shuffle=False,
+            num_workers=0,
+            drop_last=False,
+            collate_fn=dataloader.collate_fn,
+        )
+
+
+def scan_redu_stats(
+    dataloaders: list[Any],
+    ntypes: int,
+    keys: Sequence[str],
+    intensive: bool = False,
+    min_pair_dist: float = 0.0,
+) -> ReduScanResult:
+    """Accumulate exact reduced-label statistics over every training frame.
+
+    Where :func:`make_stat_input` keeps a few batches per system, this scans the
+    whole training set but retains only per-type atom counts and reduced labels,
+    compressed into one :class:`ReduStatAccumulator` per key. Elements that are
+    too rare to survive batch sampling therefore still enter the regression, at
+    a memory cost that does not grow with the number of frames.
+
+    Parameters
+    ----------
+    dataloaders
+        One data loader for each system.
+    ntypes
+        The number of atom types.
+    keys
+        Output labels whose statistics are accumulated.
+    intensive
+        Whether the fitting target is intensive.
+    min_pair_dist
+        Minimum allowed pair distance in Angstrom. Frames below the threshold
+        are excluded.
+
+    Returns
+    -------
+    ReduScanResult
+        The accumulators, the per-type atom counts and the frame count.
+
+    Notes
+    -----
+    Statistics initialization runs on the chief process only, so one scan of
+    the training set is performed per run, not per rank.
+    """
+    stats: dict[str, ReduStatAccumulator] = {}
+    natoms_total = np.zeros(ntypes, dtype=np.int64)
+    nframes = 0
+    log.info(
+        "Scanning all frames of %d systems for output statistics", len(dataloaders)
+    )
+    with torch.device("cpu"):
+        for dataloader in dataloaders:
+            for batch in _full_pass_loader(dataloader):
+                frame_mask = min_pair_dist_frame_mask(batch, min_pair_dist)
+                if frame_mask is not None:
+                    if not torch.any(frame_mask):
+                        continue
+                    batch = select_batch_frames(batch, frame_mask)
+                natoms_key = (
+                    "real_natoms_vec" if "real_natoms_vec" in batch else "natoms"
+                )
+                # natoms is [nframes, 2 + ntypes]; the first two are nall/nloc
+                natoms = to_numpy_array(batch[natoms_key])[:, 2:]
+                natoms_total += natoms.sum(axis=0).astype(np.int64)
+                nframes += natoms.shape[0]
+                for key in keys:
+                    if key not in batch or float(batch.get(f"find_{key}", 0.0)) <= 0.0:
+                        continue
+                    label = to_numpy_array(batch[key])
+                    if key not in stats:
+                        var_shape = list(label.shape[1:])
+                        stats[key] = ReduStatAccumulator(
+                            ntypes,
+                            int(np.prod(var_shape)) if var_shape else 1,
+                            var_shape,
+                            intensive=intensive,
+                        )
+                    stats[key].add(label, natoms)
+    log.info(
+        "Scanned %d frames; %d of %d types observed",
+        nframes,
+        int(np.count_nonzero(natoms_total)),
+        ntypes,
+    )
+    return ReduScanResult(stats=stats, natoms_total=natoms_total, nframes=nframes)
+
+
+def _post_process_stat(
+    out_bias: torch.Tensor,
+    out_std: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Post process the statistics.
+
+    For global statistics, we do not have the std for each type of atoms,
+    thus broadcast the global std to all the types.
+    If the shape of out_std is already the same as out_bias,
+    we do not need to do anything.
+
+    """
+    new_std = {}
+    for kk, vv in out_bias.items():
+        if vv.shape == out_std[kk].shape:
+            new_std[kk] = out_std[kk]
+        else:
+            ntypes = vv.shape[0]
+            reps = [ntypes] + [1] * (vv.ndim - 1)
+            new_std[kk] = np.tile(out_std[kk], reps)
+    return out_bias, new_std
+
+
+def _compute_model_predict(
+    sampled: Callable[[], list[dict]] | list[dict],
+    keys: list[str],
+    model_forward: Callable[..., dict[str, torch.Tensor]],
+) -> tuple[dict[str, list[np.ndarray]], list[np.ndarray]]:
+    auto_batch_size = AutoBatchSize()
+    model_predict = {kk: [] for kk in keys}
+    model_mask = []
+    for system in sampled:
+        model_coord = system.get("model_coord", system["coord"])
+        model_atype = system.get("model_atype", system["atype"])
+        nframes = model_coord.shape[0]
+        coord, atype, box = (
+            model_coord,
+            model_atype,
+            system.get("box"),
+        )
+        fparam = system.get("fparam", None)
+        aparam = system.get("model_aparam", system.get("aparam", None))
+        charge_spin = system.get("charge_spin", None)
+        spin = system.get("model_spin", system.get("spin", None))
+
+        def model_forward_auto_batch_size(*args: Any, **kwargs: Any) -> Any:
+            return auto_batch_size.execute_all(
+                model_forward,
+                nframes,
+                system["atype"].shape[-1],
+                *args,
+                **kwargs,
+            )
+
+        model_kwargs = {
+            "fparam": fparam,
+            "aparam": aparam,
+            "charge_spin": charge_spin,
+        }
+        if spin is not None:
+            model_kwargs["spin"] = spin
+        sample_predict = model_forward_auto_batch_size(
+            coord,
+            atype,
+            box,
+            **model_kwargs,
+        )
+        sample_mask = sample_predict.get("mask", atype >= 0)
+        model_mask.append(to_numpy_array(sample_mask))
+        for kk in keys:
+            model_predict[kk].append(
+                to_numpy_array(
+                    sample_predict[kk]  # nf x nloc x odims
+                )
+            )
+    return model_predict, model_mask
+
+
+def _reduce_model_prediction(
+    prediction: np.ndarray,
+    mask: np.ndarray,
+    intensive: bool,
+) -> np.ndarray:
+    """Reduce atomic predictions, rejecting undefined intensive means."""
+    reduced = np.sum(prediction, axis=1)
+    if intensive:
+        atom_count = np.sum(mask, axis=1)
+        empty_frames = np.flatnonzero(atom_count == 0)
+        if empty_frames.size:
+            raise ValueError(
+                "Cannot reduce intensive model predictions for frames with no "
+                f"unmasked atoms: {empty_frames.tolist()}."
+            )
+        atom_count = atom_count.reshape(
+            (atom_count.shape[0],) + (1,) * (reduced.ndim - 1)
+        )
+        reduced = reduced / atom_count
+    return reduced
+
+
+def _fill_stat_with_global(
+    atomic_stat: np.ndarray | None,
+    global_stat: np.ndarray,
+) -> np.ndarray | None:
+    """This function is used to fill atomic stat with global stat.
+
+    Parameters
+    ----------
+    atomic_stat : Union[np.ndarray, None]
+        The atomic stat.
+    global_stat : np.ndarray
+        The global stat.
+    if the atomic stat is None, use global stat.
+    if the atomic stat is not None, but has nan values (missing atypes), fill with global stat.
+    """
+    if atomic_stat is None:
+        return global_stat
+    else:
+        atomic_stat = atomic_stat.reshape(*global_stat.shape)
+        return np.nan_to_num(
+            np.where(
+                np.isnan(atomic_stat) & ~np.isnan(global_stat), global_stat, atomic_stat
+            )
+        )
+
+
+def compute_output_stats(
+    merged: Callable[[], list[dict]] | list[dict],
+    ntypes: int,
+    keys: str | list[str] = ["energy"],
+    stat_file_path: DPPath | None = None,
+    rcond: float | None = None,
+    preset_bias: dict[str, list[np.ndarray | None]] | None = None,
+    model_forward: Callable[..., dict[str, torch.Tensor]] | None = None,
+    stats_distinguish_types: bool = True,
+    intensive: bool = False,
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    """
+    Compute the output statistics (e.g. energy bias) for the fitting net from packed data.
+
+    Parameters
+    ----------
+    merged : Union[Callable[[], list[dict]], list[dict]]
+        - list[dict]: A list of data samples from various data systems.
+            Each element, `merged[i]`, is a data dictionary containing `keys`: `torch.Tensor`
+            originating from the `i`-th data system.
+        - Callable[[], list[dict]]: A lazy function that returns data samples in the above format
+            only when needed. Since the sampling process can be slow and memory-intensive,
+            the lazy function helps by only sampling once.
+    ntypes : int
+        The number of atom types.
+    keys : str or list[str], optional
+        Output labels whose per-type bias and standard deviation are computed.
+    stat_file_path : DPPath, optional
+        The path to the stat file.
+    rcond : float, optional
+        The condition number for the regression of atomic energy.
+    preset_bias : dict[str, list[Optional[np.ndarray]]], optional
+        Assigned values of the returned bias, given by key:value pairs.
+        The value is a list with one element per type: None leaves the type to the
+        statistics, an np.ndarray of output shape assigns the type.
+        For example: [None, [2.]] means type 0 is not set, type 1 is set to [2.]
+        The values live in the frame of the returned bias: absolute biases without
+        `model_forward`, shifts of the model's stored bias with `model_forward`.
+        The `set_davg_zero` key in the descriptor should be set.
+    model_forward : Callable[..., dict[str, torch.Tensor]], optional
+        The wrapped forward function of atomic model.
+        If not None, the model will be utilized to generate the original energy prediction,
+        which will be subtracted from the energy label of the data.
+        The difference will then be used to calculate the delta complement energy bias for each type.
+    stats_distinguish_types : bool, optional
+        Whether to distinguish different element types in the statistics.
+    intensive : bool, optional
+        Whether the fitting target is intensive.
+
+    Returns
+    -------
+    tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]
+        Per-output bias and standard-deviation tensors.
+
+    Raises
+    ------
+    ValueError
+        If output statistics must be computed but no sampled system contains a
+        valid frame.
+    RuntimeError
+        If the requested statistics cannot be computed from the available
+        labels.
+    """
+    keys = [keys] if isinstance(keys, str) else keys
+    assert isinstance(keys, list)
+    requested_keys = list(keys)
+
+    # Per-type constraints participate in both cache validation and regression.
+    assigned_bias = {
+        kk: make_preset_out_bias(ntypes, preset_bias[kk])
+        if preset_bias is not None and kk in preset_bias
+        else None
+        for kk in keys
+    }
+
+    # a full scan cannot replace the sampled path for delta bias or type-blind
+    # statistics, so resolve it before the cache is consulted
+    redu_scanner = get_redu_stat_scanner(merged)
+    if redu_scanner is not None and (
+        model_forward is not None or not stats_distinguish_types
+    ):
+        log.warning(
+            "Falling back to sampled output statistics: a full scan supports "
+            "neither delta bias nor stats_distinguish_types=False."
+        )
+        redu_scanner = None
+
+    # Model residuals depend on parameters not recorded in the statistics cache.
+    # Neither reuse nor persist them as absolute output statistics.
+    if model_forward is not None:
+        stat_file_path = None
+
+    # try to restore the bias from stat file
+    bias_atom_e, std_atom_e = load_output_stats(stat_file_path, keys, assigned_bias)
+    if (
+        bias_atom_e is not None
+        and redu_scanner is not None
+        and not load_output_stat_full_scan(stat_file_path)
+    ):
+        # the cache holds sampled values, which is what data_stat_full replaces
+        if getattr(stat_file_path, "mode", None) == "r":
+            log.warning(
+                "`data_stat_full` is set, but the read-only statistics cache "
+                "holds output statistics estimated from sampled batches; they "
+                "are used as they are."
+            )
+        else:
+            log.info(
+                "Recomputing output statistics: the cache holds values "
+                "estimated from sampled batches, which `data_stat_full` "
+                "replaces."
+            )
+            bias_atom_e, std_atom_e = None, None
+
+    # failed to restore the bias from stat file. compute
+    if bias_atom_e is None:
+        # only get data once, sampled is a list of dict[str, torch.Tensor]
+        sampled = merged() if callable(merged) else merged
+        if not sampled:
+            raise ValueError(
+                "Output statistics require at least one sampled system with a "
+                "valid frame."
+            )
+        if model_forward is not None:
+            model_pred, model_mask = _compute_model_predict(
+                sampled,
+                keys,
+                model_forward,
+            )
+        else:
+            model_pred = None
+            model_mask = []
+
+        # remove the keys that are not in the sample
+        new_keys = [
+            ii
+            for ii in keys
+            if (ii in sampled[0].keys()) or ("atom_" + ii in sampled[0].keys())
+        ]
+        keys = new_keys
+        # split system based on label
+        atomic_sampled_idx = defaultdict(list)
+        global_sampled_idx = defaultdict(list)
+
+        for kk in keys:
+            for idx, system in enumerate(sampled):
+                if (("find_atom_" + kk) in system) and (
+                    system["find_atom_" + kk] > 0.0
+                ):
+                    atomic_sampled_idx[kk].append(idx)
+                if (("find_" + kk) in system) and (system["find_" + kk] > 0.0):
+                    global_sampled_idx[kk].append(idx)
+
+        # use index to gather model predictions for the corresponding systems.
+
+        model_pred_g = (
+            {
+                kk: [
+                    _reduce_model_prediction(
+                        vv[idx],
+                        model_mask[idx],
+                        intensive,
+                    )
+                    for idx in global_sampled_idx[kk]
+                ]
+                for kk, vv in model_pred.items()
+            }
+            if model_pred
+            else None
+        )
+        model_pred_a = (
+            {
+                kk: [vv[idx] for idx in atomic_sampled_idx[kk]]
+                for kk, vv in model_pred.items()
+            }
+            if model_pred
+            else None
+        )
+
+        # concat all frames within those systems
+        model_pred_g = (
+            {
+                kk: np.concatenate(model_pred_g[kk])
+                for kk in model_pred_g.keys()
+                if len(model_pred_g[kk]) > 0
+            }
+            if model_pred
+            else None
+        )
+        model_pred_a = (
+            {
+                kk: np.concatenate(model_pred_a[kk])
+                for kk in model_pred_a.keys()
+                if len(model_pred_a[kk]) > 0
+            }
+            if model_pred
+            else None
+        )
+
+        # compute stat
+        bias_atom_g, std_atom_g = _compute_output_stats_global(
+            sampled,
+            ntypes,
+            keys,
+            rcond,
+            assigned_bias,
+            global_sampled_idx,
+            stats_distinguish_types,
+            intensive,
+            model_pred_g,
+            redu_scanner,
+        )
+        bias_atom_a, std_atom_a = _compute_output_stats_atomic(
+            sampled,
+            ntypes,
+            keys,
+            atomic_sampled_idx,
+            model_pred_a,
+            assigned_bias,
+        )
+
+        # merge global/atomic bias
+        bias_atom_e, std_atom_e = {}, {}
+        for kk in keys:
+            # use atomic bias whenever available
+            if kk in bias_atom_a:
+                bias_atom_e[kk] = bias_atom_a[kk]
+                std_atom_e[kk] = std_atom_a[kk]
+            else:
+                bias_atom_e[kk] = None
+                std_atom_e[kk] = None
+            # use global bias to fill missing atomic bias
+            if kk in bias_atom_g:
+                bias_atom_e[kk] = _fill_stat_with_global(
+                    bias_atom_e[kk], bias_atom_g[kk]
+                )
+                std_atom_e[kk] = _fill_stat_with_global(std_atom_e[kk], std_atom_g[kk])
+            if (bias_atom_e[kk] is None) or (std_atom_e[kk] is None):
+                raise RuntimeError("Fail to compute stat.")
+
+        if stat_file_path is not None:
+            # withdraw any standing claim before the values it describes are
+            # replaced, so an interruption leaves the cache looking sampled
+            save_output_stat_full_scan(stat_file_path, False)
+            save_output_stats(
+                stat_file_path,
+                requested_keys,
+                bias_atom_e,
+                std_atom_e,
+                assigned_bias,
+            )
+            save_output_stat_full_scan(stat_file_path, redu_scanner is not None)
+
+    bias_atom_e = {kk: to_torch_tensor(vv) for kk, vv in bias_atom_e.items()}
+    std_atom_e = {kk: to_torch_tensor(vv) for kk, vv in std_atom_e.items()}
+    return bias_atom_e, std_atom_e
+
+
+def _compute_output_stats_global(
+    sampled: list[dict],
+    ntypes: int,
+    keys: list[str],
+    rcond: float | None = None,
+    assigned_bias: dict[str, np.ndarray | None] | None = None,
+    global_sampled_idx: dict | None = None,
+    stats_distinguish_types: bool = True,
+    intensive: bool = False,
+    model_pred: dict[str, np.ndarray] | None = None,
+    redu_scanner: ReduStatScanner | None = None,
+) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+    """This function only handle stat computation from reduced global labels.
+
+    When *redu_scanner* is given, the bias and std come from a scan of every
+    training frame instead of the sampled batches, which keeps rare elements
+    from being under-represented in the regression. The caller decides whether
+    a scan is admissible; it is ignored for delta bias and type-blind statistics.
+    """
+    # return directly if no global samples
+    if global_sampled_idx is None or all(
+        len(v) == 0 for v in global_sampled_idx.values()
+    ):
+        return {}, {}
+
+    # get label dict from sample; for each key, only picking the system with global labels.
+    outputs = {
+        kk: [to_numpy_array(sampled[idx][kk]) for idx in global_sampled_idx.get(kk, [])]
+        for kk in keys
+    }
+
+    data_mixed_type = "real_natoms_vec" in sampled[0]
+    natoms_key = "natoms" if not data_mixed_type else "real_natoms_vec"
+    input_natoms = {}
+    for kk in keys:
+        kk_natoms = []
+        for idx in global_sampled_idx.get(kk, []):
+            nn = to_numpy_array(sampled[idx][natoms_key])
+            if "atom_exclude_types" in sampled[idx]:
+                nn = nn.copy()
+                type_mask = AtomExcludeMask(
+                    ntypes, sampled[idx]["atom_exclude_types"]
+                ).get_type_mask()
+                nn[:, 2:] *= to_numpy_array(type_mask).reshape(1, -1)
+            kk_natoms.append(nn)
+        input_natoms[kk] = kk_natoms
+    # shape: (nframes, ndim)
+    merged_output = {
+        kk: np.concatenate(outputs[kk]) for kk in keys if len(outputs[kk]) > 0
+    }
+    # shape: (nframes, ntypes)
+    merged_natoms = {
+        kk: np.concatenate(input_natoms[kk])[:, 2:]
+        for kk in keys
+        if len(input_natoms[kk]) > 0
+    }
+    nf = {kk: merged_natoms[kk].shape[0] for kk in keys if kk in merged_natoms}
+    if assigned_bias is None:
+        assigned_bias = dict.fromkeys(keys)
+
+    if model_pred is None:
+        stats_input = merged_output
+    else:
+        # subtract the model bias and output the delta bias
+
+        stats_input = {
+            kk: merged_output[kk] - model_pred[kk].reshape(merged_output[kk].shape)
+            for kk in keys
+            if kk in merged_output
+        }
+
+    scan = (
+        redu_scanner.scan(ntypes, keys, intensive)
+        if redu_scanner is not None and model_pred is None and stats_distinguish_types
+        else None
+    )
+    # one model-level source writes atom_exclude_types onto every sample, so
+    # the first one carries the mask the whole scan needs
+    type_mask = (
+        to_numpy_array(
+            AtomExcludeMask(ntypes, sampled[0]["atom_exclude_types"]).get_type_mask()
+        )
+        if scan is not None and "atom_exclude_types" in sampled[0]
+        else None
+    )
+
+    bias_atom_e = {}
+    std_atom_e = {}
+    scanned_keys = set()
+    for kk in keys:
+        if scan is not None and kk in scan.stats:
+            bias_atom_e[kk], std_atom_e[kk] = scan.stats[kk].solve(
+                assigned_bias=assigned_bias[kk],
+                rcond=rcond,
+                type_mask=type_mask,
+            )
+            scanned_keys.add(kk)
+        elif kk in stats_input:
+            if not stats_distinguish_types:
+                bias_atom_e[kk], std_atom_e[kk] = (
+                    compute_stats_do_not_distinguish_types(
+                        stats_input[kk],
+                        merged_natoms[kk],
+                        intensive=intensive,
+                    )
+                )
+            else:
+                bias_atom_e[kk], std_atom_e[kk] = compute_stats_from_redu(
+                    stats_input[kk],
+                    merged_natoms[kk],
+                    assigned_bias=assigned_bias[kk],
+                    rcond=rcond,
+                    intensive=intensive,
+                )
+        else:
+            # this key does not have global labels, skip it.
+            continue
+    bias_atom_e, std_atom_e = _post_process_stat(bias_atom_e, std_atom_e)
+
+    # unbias_e is only used for print rmse
+
+    unbias_e = {}
+    for kk in bias_atom_e.keys():
+        if kk in scanned_keys or kk not in merged_natoms:
+            continue
+        coeffs = merged_natoms[kk]
+        if intensive:
+            total_atoms = coeffs.sum(axis=1, keepdims=True)
+            coeffs = coeffs / total_atoms
+        recon = coeffs @ bias_atom_e[kk].reshape(ntypes, -1)
+        if model_pred is not None:
+            recon += model_pred[kk].reshape(nf[kk], -1)
+        unbias_e[kk] = recon
+
+    def rmse(x: np.ndarray) -> float:
+        return np.sqrt(np.mean(np.square(x)))
+
+    for kk in scanned_keys:
+        log.info(
+            f"Std of {kk} residual after linear regression over "
+            f"{scan.stats[kk].nframes} frames is: {std_atom_e[kk].reshape(-1)[0]} "
+            f"in the unit of {kk}."
+        )
+    for kk in unbias_e.keys():
+        diff = unbias_e[kk].reshape(nf[kk], -1) - merged_output[kk].reshape(nf[kk], -1)
+        if not intensive:
+            diff /= merged_natoms[kk].sum(axis=-1, keepdims=True)
+        rmse_ae = rmse(diff)
+        stat_type = "per atom " if not intensive else ""
+        log.info(
+            f"RMSE of {kk} {stat_type}after linear regression is: {rmse_ae} in the unit of {kk}."
+        )
+    return bias_atom_e, std_atom_e
+
+
+def _compute_output_stats_atomic(
+    sampled: list[dict],
+    ntypes: int,
+    keys: list[str],
+    atomic_sampled_idx: dict | None = None,
+    model_pred: dict[str, np.ndarray] | None = None,
+    assigned_bias: dict[str, np.ndarray | None] | None = None,
+) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+    """Compute output statistics from atomic labels."""
+    # return directly if no atomic samples
+    if atomic_sampled_idx is None or all(
+        len(v) == 0 for v in atomic_sampled_idx.values()
+    ):
+        return {}, {}
+    if assigned_bias is None:
+        assigned_bias = dict.fromkeys(keys)
+
+    # get label dict from sample; for each key, only picking the system with atomic labels.
+    outputs = {
+        kk: [
+            to_numpy_array(sampled[idx]["atom_" + kk])
+            for idx in atomic_sampled_idx.get(kk, [])
+        ]
+        for kk in keys
+    }
+    natoms = {
+        kk: [
+            to_numpy_array(sampled[idx]["atype"])
+            for idx in atomic_sampled_idx.get(kk, [])
+        ]
+        for kk in keys
+    }
+    # reshape outputs [nframes, nloc * ndim] --> reshape to [nframes * nloc, 1, ndim] for concatenation
+    # reshape natoms [nframes, nloc] --> reshape to [nframes * nolc, 1] for concatenation
+    natoms = {k: [sys_v.reshape(-1, 1) for sys_v in v] for k, v in natoms.items()}
+    outputs = {
+        k: [
+            sys.reshape(natoms[k][sys_idx].shape[0], 1, -1)
+            for sys_idx, sys in enumerate(v)
+        ]
+        for k, v in outputs.items()
+    }
+
+    merged_output = {
+        kk: np.concatenate(outputs[kk]) for kk in keys if len(outputs[kk]) > 0
+    }
+    merged_natoms = {
+        kk: np.concatenate(natoms[kk]) for kk in keys if len(natoms[kk]) > 0
+    }
+    # reshape merged data to [nf, nloc, ndim]
+    merged_output = {
+        kk: merged_output[kk].reshape((*merged_natoms[kk].shape, -1))
+        for kk in merged_output
+    }
+
+    if model_pred is None:
+        stats_input = merged_output
+    else:
+        # subtract the model bias and output the delta bias
+        stats_input = {
+            kk: merged_output[kk] - model_pred[kk].reshape(*merged_output[kk].shape)
+            for kk in keys
+            if kk in merged_output
+        }
+
+    bias_atom_e = {}
+    std_atom_e = {}
+
+    for kk in keys:
+        if kk in stats_input:
+            bias_atom_e[kk], std_atom_e[kk] = compute_stats_from_atomic(
+                stats_input[kk],
+                merged_natoms[kk],
+            )
+            # correction for missing types
+            missing_types = ntypes - merged_natoms[kk].max() - 1
+            if missing_types > 0:
+                assert bias_atom_e[kk].dtype is std_atom_e[kk].dtype, (
+                    "bias and std should be of the same dtypes"
+                )
+                nan_padding = np.empty(
+                    (missing_types, bias_atom_e[kk].shape[1]),
+                    dtype=bias_atom_e[kk].dtype,
+                )
+                nan_padding.fill(np.nan)
+                bias_atom_e[kk] = np.concatenate([bias_atom_e[kk], nan_padding], axis=0)
+                std_atom_e[kk] = np.concatenate([std_atom_e[kk], nan_padding], axis=0)
+            # the per-type means are independent, so an assigned type is
+            # overridden exactly
+            bias_atom_e[kk] = override_assigned_bias(bias_atom_e[kk], assigned_bias[kk])
+        else:
+            # this key does not have atomic labels, skip it.
+            continue
+    return bias_atom_e, std_atom_e

@@ -1,0 +1,637 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
+import unittest
+from copy import (
+    deepcopy,
+)
+from typing import (
+    Any,
+)
+
+import numpy as np
+from dargs import (
+    Argument,
+)
+
+from deepmd.dpmodel.descriptor.dpa3 import DescrptDPA3 as DescrptDPA3DP
+from deepmd.env import (
+    GLOBAL_NP_FLOAT_PRECISION,
+)
+
+from ..common import (
+    INSTALLED_ARRAY_API_STRICT,
+    INSTALLED_JAX,
+    INSTALLED_PD,
+    INSTALLED_PT,
+    INSTALLED_PT_EXPT,
+    INSTALLED_TF2,
+    CommonTest,
+    parameterized_cases,
+)
+from .common import (
+    DescriptorAPITest,
+    DescriptorTest,
+)
+
+if INSTALLED_PT:
+    from deepmd.pt.model.descriptor.dpa3 import DescrptDPA3 as DescrptDPA3PT
+else:
+    DescrptDPA3PT = None
+
+if INSTALLED_JAX:
+    from deepmd.jax.descriptor.dpa3 import DescrptDPA3 as DescrptDPA3JAX
+else:
+    DescrptDPA3JAX = None
+
+if INSTALLED_PD:
+    from deepmd.pd.model.descriptor.dpa3 import DescrptDPA3 as DescrptDPA3PD
+else:
+    DescrptDPA3PD = None
+
+if INSTALLED_PT_EXPT:
+    from deepmd.pt_expt.descriptor.dpa3 import DescrptDPA3 as DescrptDPA3PTExpt
+else:
+    DescrptDPA3PTExpt = None
+if INSTALLED_ARRAY_API_STRICT:
+    from ...array_api_strict.descriptor.dpa3 import DescrptDPA3 as DescrptDPA3Strict
+else:
+    DescrptDPA3Strict = None
+
+# not implemented
+DescrptDPA3TF = None
+if INSTALLED_TF2:
+    from deepmd.tf2.descriptor.dpa3 import DescrptDPA3 as DescrptDPA3TF2
+else:
+    DescrptDPA3TF2 = None
+
+from deepmd.dpmodel.descriptor.dpa3 import (
+    RepFlowArgs,
+)
+from deepmd.utils.argcheck import (
+    descrpt_dpa3_args,
+)
+
+DPA3_CASE_FIELDS = (
+    "update_residual_init",
+    "exclude_types",
+    "update_angle",
+    "a_compress_rate",
+    "a_compress_e_rate",
+    "a_compress_use_split",
+    "optim_update",
+    "edge_init_use_dist",
+    "use_exp_switch",
+    "use_dynamic_sel",
+    "use_loc_mapping",
+    "fix_stat_std",
+    "n_multi_edge_message",
+    "precision",
+    "add_chg_spin_ebd",
+    "default_chg_spin",
+    "sequential_update",
+)
+
+
+DPA3_BASELINE_CASE = {
+    "update_residual_init": "const",
+    "exclude_types": [],
+    "update_angle": True,
+    "a_compress_rate": 0,
+    "a_compress_e_rate": 1,
+    "a_compress_use_split": True,
+    "optim_update": True,
+    "edge_init_use_dist": True,
+    "use_exp_switch": True,
+    "use_dynamic_sel": True,
+    "use_loc_mapping": True,
+    "fix_stat_std": 0.3,
+    "n_multi_edge_message": 1,
+    "precision": "float64",
+    "add_chg_spin_ebd": False,
+    "default_chg_spin": None,
+    "sequential_update": False,
+}
+
+
+def _build_dpa3_case(fields: tuple[str, ...], **overrides: Any) -> tuple:
+    unknown = set(overrides) - set(DPA3_BASELINE_CASE)
+    if unknown:
+        raise KeyError(f"Unknown DPA3 case override(s): {sorted(unknown)}")
+    case = deepcopy(DPA3_BASELINE_CASE)
+    case.update(overrides)
+    return tuple(case[field] for field in fields)
+
+
+def dpa3_case(**overrides: Any) -> tuple:
+    return _build_dpa3_case(DPA3_CASE_FIELDS, **overrides)
+
+
+DPA3_CURATED_CASES = (
+    # Baseline coverage.
+    dpa3_case(),
+    # Descriptor-level edge cases.
+    dpa3_case(exclude_types=[[0, 1]]),
+    dpa3_case(use_loc_mapping=False),
+    dpa3_case(add_chg_spin_ebd=True),
+    dpa3_case(add_chg_spin_ebd=True, default_chg_spin=[5.0, 1.0]),
+    # Repflow compression branches.
+    dpa3_case(a_compress_rate=1),
+    dpa3_case(a_compress_e_rate=2),
+    # Repflow update toggles.
+    dpa3_case(optim_update=False),
+    dpa3_case(edge_init_use_dist=False),
+    dpa3_case(use_exp_switch=False),
+    dpa3_case(use_dynamic_sel=False),
+    dpa3_case(sequential_update=True),
+    # One mixed high-risk path to keep interactions covered.
+    dpa3_case(
+        exclude_types=[[0, 1]],
+        a_compress_rate=1,
+        a_compress_e_rate=2,
+        optim_update=False,
+        edge_init_use_dist=False,
+        use_exp_switch=False,
+        use_dynamic_sel=False,
+        use_loc_mapping=False,
+        add_chg_spin_ebd=True,
+        sequential_update=True,
+    ),
+)
+
+
+DPA3_DESCRIPTOR_API_CASE_FIELDS = DPA3_CASE_FIELDS
+
+
+def dpa3_descriptor_api_case(**overrides: Any) -> tuple:
+    return _build_dpa3_case(DPA3_DESCRIPTOR_API_CASE_FIELDS, **overrides)
+
+
+DPA3_DESCRIPTOR_API_CURATED_CASES = (
+    # Baseline coverage.
+    dpa3_descriptor_api_case(),
+    # Descriptor serialization / config toggles.
+    dpa3_descriptor_api_case(exclude_types=[[0, 1]]),
+    dpa3_descriptor_api_case(use_loc_mapping=False),
+    dpa3_descriptor_api_case(fix_stat_std=0.0),
+    dpa3_descriptor_api_case(add_chg_spin_ebd=True),
+    dpa3_descriptor_api_case(add_chg_spin_ebd=True, default_chg_spin=[5.0, 1.0]),
+    # Repflow compression branches.
+    dpa3_descriptor_api_case(a_compress_rate=1),
+    dpa3_descriptor_api_case(a_compress_e_rate=2),
+    # Repflow update toggles.
+    dpa3_descriptor_api_case(optim_update=False),
+    dpa3_descriptor_api_case(edge_init_use_dist=False),
+    dpa3_descriptor_api_case(use_exp_switch=False),
+    dpa3_descriptor_api_case(use_dynamic_sel=False),
+    dpa3_descriptor_api_case(sequential_update=True),
+    # One mixed high-risk path to keep interactions covered.
+    dpa3_descriptor_api_case(
+        exclude_types=[[0, 1]],
+        a_compress_rate=1,
+        a_compress_e_rate=2,
+        optim_update=False,
+        edge_init_use_dist=False,
+        use_exp_switch=False,
+        use_dynamic_sel=False,
+        use_loc_mapping=False,
+        fix_stat_std=0.0,
+        add_chg_spin_ebd=True,
+        sequential_update=True,
+    ),
+)
+
+
+@parameterized_cases(*DPA3_CURATED_CASES)
+class TestDPA3(CommonTest, DescriptorTest, unittest.TestCase):
+    @property
+    def data(self) -> dict:
+        (
+            update_residual_init,
+            exclude_types,
+            update_angle,
+            a_compress_rate,
+            a_compress_e_rate,
+            a_compress_use_split,
+            optim_update,
+            edge_init_use_dist,
+            use_exp_switch,
+            use_dynamic_sel,
+            use_loc_mapping,
+            fix_stat_std,
+            n_multi_edge_message,
+            precision,
+            add_chg_spin_ebd,
+            default_chg_spin,
+            sequential_update,
+        ) = self.param
+        return {
+            "ntypes": self.ntypes,
+            # kwargs for repinit
+            "repflow": RepFlowArgs(
+                **{
+                    "n_dim": 20,
+                    "e_dim": 10,
+                    "a_dim": 8,
+                    "nlayers": 3,
+                    "e_rcut": 6.0,
+                    "e_rcut_smth": 5.0,
+                    "e_sel": 10,
+                    "a_rcut": 4.0,
+                    "a_rcut_smth": 3.5,
+                    "a_sel": 8,
+                    "a_compress_rate": a_compress_rate,
+                    "a_compress_e_rate": a_compress_e_rate,
+                    "a_compress_use_split": a_compress_use_split,
+                    "optim_update": optim_update,
+                    "edge_init_use_dist": edge_init_use_dist,
+                    "use_exp_switch": use_exp_switch,
+                    "use_dynamic_sel": use_dynamic_sel,
+                    "smooth_edge_update": True,
+                    "fix_stat_std": fix_stat_std,
+                    "n_multi_edge_message": n_multi_edge_message,
+                    "axis_neuron": 4,
+                    "update_angle": update_angle,
+                    "update_style": "res_residual",
+                    "update_residual": 0.1,
+                    "update_residual_init": update_residual_init,
+                    "sequential_update": sequential_update,
+                }
+            ),
+            # kwargs for descriptor
+            "activation_function": "relu",
+            "precision": precision,
+            "exclude_types": exclude_types,
+            "env_protection": 0.0,
+            "use_loc_mapping": use_loc_mapping,
+            "trainable": False,
+            "add_chg_spin_ebd": add_chg_spin_ebd,
+            "default_chg_spin": default_chg_spin,
+        }
+
+    @property
+    def skip_pt(self) -> bool:
+        (
+            _update_residual_init,
+            _exclude_types,
+            _update_angle,
+            _a_compress_rate,
+            _a_compress_e_rate,
+            _a_compress_use_split,
+            _optim_update,
+            _edge_init_use_dist,
+            _use_exp_switch,
+            _use_dynamic_sel,
+            _use_loc_mapping,
+            _fix_stat_std,
+            _n_multi_edge_message,
+            _precision,
+            _add_chg_spin_ebd,
+            _default_chg_spin,
+            _sequential_update,
+        ) = self.param
+        return CommonTest.skip_pt
+
+    @property
+    def skip_pd(self) -> bool:
+        return CommonTest.skip_pd
+
+    @property
+    def skip_dp(self) -> bool:
+        (
+            _update_residual_init,
+            _exclude_types,
+            _update_angle,
+            _a_compress_rate,
+            _a_compress_e_rate,
+            _a_compress_use_split,
+            _optim_update,
+            _edge_init_use_dist,
+            _use_exp_switch,
+            _use_dynamic_sel,
+            _use_loc_mapping,
+            _fix_stat_std,
+            _n_multi_edge_message,
+            _precision,
+            _add_chg_spin_ebd,
+            _default_chg_spin,
+            _sequential_update,
+        ) = self.param
+        return CommonTest.skip_dp
+
+    @property
+    def skip_tf(self) -> bool:
+        (
+            _update_residual_init,
+            _exclude_types,
+            _update_angle,
+            _a_compress_rate,
+            _a_compress_e_rate,
+            _a_compress_use_split,
+            _optim_update,
+            _edge_init_use_dist,
+            _use_exp_switch,
+            _use_dynamic_sel,
+            _use_loc_mapping,
+            _fix_stat_std,
+            _n_multi_edge_message,
+            _precision,
+            _add_chg_spin_ebd,
+            _default_chg_spin,
+            _sequential_update,
+        ) = self.param
+        return True
+
+    skip_jax = not INSTALLED_JAX
+    skip_array_api_strict = not INSTALLED_ARRAY_API_STRICT
+    skip_pt_expt = not INSTALLED_PT_EXPT
+    skip_tf2 = not INSTALLED_TF2
+
+    tf_class = DescrptDPA3TF
+    tf2_class = DescrptDPA3TF2
+    dp_class = DescrptDPA3DP
+    pt_class = DescrptDPA3PT
+    pt_expt_class = DescrptDPA3PTExpt
+    pd_class = DescrptDPA3PD
+    jax_class = DescrptDPA3JAX
+    array_api_strict_class = DescrptDPA3Strict
+    args = descrpt_dpa3_args().append(Argument("ntypes", int, optional=False))
+
+    def setUp(self) -> None:
+        CommonTest.setUp(self)
+
+        self.ntypes = 2
+        self.coords = np.array(
+            [
+                12.83,
+                2.56,
+                2.18,
+                12.09,
+                2.87,
+                2.74,
+                00.25,
+                3.32,
+                1.68,
+                3.36,
+                3.00,
+                1.81,
+                3.51,
+                2.51,
+                2.60,
+                4.27,
+                3.22,
+                1.56,
+            ],
+            dtype=GLOBAL_NP_FLOAT_PRECISION,
+        )
+        self.atype = np.array([0, 1, 1, 0, 1, 1], dtype=np.int32)
+        self.box = np.array(
+            [13.0, 0.0, 0.0, 0.0, 13.0, 0.0, 0.0, 0.0, 13.0],
+            dtype=GLOBAL_NP_FLOAT_PRECISION,
+        )
+        self.natoms = np.array([6, 6, 2, 4], dtype=np.int32)
+        (
+            _update_residual_init,
+            _exclude_types,
+            _update_angle,
+            _a_compress_rate,
+            _a_compress_e_rate,
+            _a_compress_use_split,
+            _optim_update,
+            _edge_init_use_dist,
+            _use_exp_switch,
+            _use_dynamic_sel,
+            _use_loc_mapping,
+            _fix_stat_std,
+            _n_multi_edge_message,
+            _precision,
+            add_chg_spin_ebd,
+            _default_chg_spin,
+            _sequential_update,
+        ) = self.param
+        self.charge_spin = (
+            np.array([[5, 1]], dtype=GLOBAL_NP_FLOAT_PRECISION)
+            if add_chg_spin_ebd
+            else None
+        )
+
+    def build_tf(self, obj: Any, suffix: str) -> tuple[list, dict]:
+        return self.build_tf_descriptor(
+            obj,
+            self.natoms,
+            self.coords,
+            self.atype,
+            self.box,
+            suffix,
+        )
+
+    def eval_dp(self, dp_obj: Any) -> Any:
+        return self.eval_dp_descriptor(
+            dp_obj,
+            self.natoms,
+            self.coords,
+            self.atype,
+            self.box,
+            mixed_types=True,
+            charge_spin=self.charge_spin,
+        )
+
+    def eval_pt(self, pt_obj: Any) -> Any:
+        return self.eval_pt_descriptor(
+            pt_obj,
+            self.natoms,
+            self.coords,
+            self.atype,
+            self.box,
+            mixed_types=True,
+            charge_spin=self.charge_spin,
+        )
+
+    def eval_pd(self, pd_obj: Any) -> Any:
+        return self.eval_pd_descriptor(
+            pd_obj,
+            self.natoms,
+            self.coords,
+            self.atype,
+            self.box,
+            mixed_types=True,
+            charge_spin=self.charge_spin,
+        )
+
+    def eval_jax(self, jax_obj: Any) -> Any:
+        return self.eval_jax_descriptor(
+            jax_obj,
+            self.natoms,
+            self.coords,
+            self.atype,
+            self.box,
+            mixed_types=True,
+            charge_spin=self.charge_spin,
+        )
+
+    def eval_pt_expt(self, pt_expt_obj: Any) -> Any:
+        return self.eval_pt_expt_descriptor(
+            pt_expt_obj,
+            self.natoms,
+            self.coords,
+            self.atype,
+            self.box,
+            mixed_types=True,
+            charge_spin=self.charge_spin,
+        )
+
+    def eval_tf2(self, tf2_obj: Any) -> Any:
+        return self.eval_tf2_descriptor(
+            tf2_obj,
+            self.natoms,
+            self.coords,
+            self.atype,
+            self.box,
+            mixed_types=True,
+            charge_spin=self.charge_spin,
+        )
+
+    def eval_array_api_strict(self, array_api_strict_obj: Any) -> Any:
+        return self.eval_array_api_strict_descriptor(
+            array_api_strict_obj,
+            self.natoms,
+            self.coords,
+            self.atype,
+            self.box,
+            mixed_types=True,
+            charge_spin=self.charge_spin,
+        )
+
+    def extract_ret(self, ret: Any, backend) -> tuple[np.ndarray, ...]:
+        return (ret[0],)
+
+    @property
+    def rtol(self) -> float:
+        """Relative tolerance for comparing the return value."""
+        (
+            _update_residual_init,
+            _exclude_types,
+            _update_angle,
+            _a_compress_rate,
+            _a_compress_e_rate,
+            _a_compress_use_split,
+            _optim_update,
+            _edge_init_use_dist,
+            _use_exp_switch,
+            _use_dynamic_sel,
+            _use_loc_mapping,
+            _fix_stat_std,
+            _n_multi_edge_message,
+            precision,
+            _add_chg_spin_ebd,
+            _default_chg_spin,
+            _sequential_update,
+        ) = self.param
+        if precision == "float64":
+            return 1e-10
+        elif precision == "float32":
+            return 1e-4
+        else:
+            raise ValueError(f"Unknown precision: {precision}")
+
+    @property
+    def atol(self) -> float:
+        """Absolute tolerance for comparing the return value."""
+        (
+            _update_residual_init,
+            _exclude_types,
+            _update_angle,
+            _a_compress_rate,
+            _a_compress_e_rate,
+            _a_compress_use_split,
+            _optim_update,
+            _edge_init_use_dist,
+            _use_exp_switch,
+            _use_dynamic_sel,
+            _use_loc_mapping,
+            _fix_stat_std,
+            _n_multi_edge_message,
+            precision,
+            _add_chg_spin_ebd,
+            _default_chg_spin,
+            _sequential_update,
+        ) = self.param
+        if precision == "float64":
+            return 1e-6  # need to fix in the future, see issue https://github.com/deepmodeling/deepmd-kit/issues/3786
+        elif precision == "float32":
+            return 1e-4
+        else:
+            raise ValueError(f"Unknown precision: {precision}")
+
+
+@parameterized_cases(*DPA3_DESCRIPTOR_API_CURATED_CASES)
+class TestDPA3DescriptorAPI(DescriptorAPITest, unittest.TestCase):
+    """Test consistency of BaseDescriptor API methods across backends."""
+
+    dp_class = DescrptDPA3DP
+    pt_class = DescrptDPA3PT
+    pt_expt_class = DescrptDPA3PTExpt
+    args = descrpt_dpa3_args().append(Argument("ntypes", int, optional=False))
+
+    @property
+    def data(self) -> dict:
+        (
+            update_residual_init,
+            exclude_types,
+            update_angle,
+            a_compress_rate,
+            a_compress_e_rate,
+            a_compress_use_split,
+            optim_update,
+            edge_init_use_dist,
+            use_exp_switch,
+            use_dynamic_sel,
+            use_loc_mapping,
+            fix_stat_std,
+            n_multi_edge_message,
+            precision,
+            add_chg_spin_ebd,
+            default_chg_spin,
+            sequential_update,
+        ) = self.param
+        return {
+            "ntypes": self.ntypes,
+            # kwargs for repinit
+            "repflow": RepFlowArgs(
+                **{
+                    "n_dim": 20,
+                    "e_dim": 10,
+                    "a_dim": 8,
+                    "nlayers": 3,
+                    "e_rcut": 6.0,
+                    "e_rcut_smth": 5.0,
+                    "e_sel": 10,
+                    "a_rcut": 4.0,
+                    "a_rcut_smth": 3.5,
+                    "a_sel": 8,
+                    "a_compress_rate": a_compress_rate,
+                    "a_compress_e_rate": a_compress_e_rate,
+                    "a_compress_use_split": a_compress_use_split,
+                    "optim_update": optim_update,
+                    "edge_init_use_dist": edge_init_use_dist,
+                    "use_exp_switch": use_exp_switch,
+                    "use_dynamic_sel": use_dynamic_sel,
+                    "smooth_edge_update": True,
+                    "fix_stat_std": fix_stat_std,
+                    "n_multi_edge_message": n_multi_edge_message,
+                    "axis_neuron": 4,
+                    "update_angle": update_angle,
+                    "update_style": "res_residual",
+                    "update_residual": 0.1,
+                    "update_residual_init": update_residual_init,
+                    "sequential_update": sequential_update,
+                }
+            ),
+            # kwargs for descriptor
+            "activation_function": "relu",
+            "precision": precision,
+            "exclude_types": exclude_types,
+            "env_protection": 0.0,
+            "use_loc_mapping": use_loc_mapping,
+            "trainable": False,
+            "add_chg_spin_ebd": add_chg_spin_ebd,
+            "default_chg_spin": default_chg_spin,
+        }

@@ -1,0 +1,371 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
+"""Parity tests for the DPA4 SO3-grid per-degree frame mixers.
+
+These mirror the current pt
+``deepmd.pt.model.descriptor.sezm_nn.grid_net`` ``FrameContract`` /
+``FrameExpand`` (and the ``_build_frame_degree_index`` helper). The
+backend-independent mathematical contract of both mixers is the per-degree
+``einsum("ndfi,dio->ndfo", coeff, weight[degree_index])``; both backends
+realise it through the same ``(D, F)``-batched matmul lowering
+(``_degree_batched_matmul``), which these tests pin against the einsum
+contract for values and gradients.
+
+pt imports live inside the test functions because ruff TID253 bans
+module-level ``deepmd.pt`` imports under ``source/tests/common``. pt modules
+are pinned to CPU so ``torch.from_numpy`` fp64 inputs and the module agree
+under the CUDA-default-device CI configuration.
+"""
+
+import numpy as np
+import pytest
+
+from deepmd.dpmodel.descriptor.dpa4_nn.grid_net import FrameContract as DPFrameContract
+from deepmd.dpmodel.descriptor.dpa4_nn.grid_net import FrameExpand as DPFrameExpand
+from deepmd.dpmodel.descriptor.dpa4_nn.grid_net import (
+    _build_frame_degree_index,
+)
+
+# (lmax, channels, kmax); n_frames K = 2 * kmax + 1
+_CASES = [(2, 4, 1), (3, 2, 2)]
+
+
+def _copy_weight(pt_mod, dp_mod) -> None:
+    """Copy the pt mixer ``weight`` state-dict entry into the dpmodel mixer."""
+    state = {k: v.detach().cpu().numpy() for k, v in pt_mod.state_dict().items()}
+    assert set(state) == {"weight"}, state.keys()
+    dp_mod.weight = state["weight"]
+
+
+@pytest.mark.parametrize("lmax,channels,kmax", _CASES)  # degree, channels, kmax
+def test_frame_contract_parity(lmax, channels, kmax) -> None:
+    """The dpmodel ``FrameContract`` matches pt with weight-copied fp64 weights."""
+    import torch
+
+    from deepmd.pt.model.descriptor.sezm_nn.grid_net import (
+        FrameContract as PTFrameContract,
+    )
+
+    n_frames = 2 * kmax + 1
+    coeff_dim = (lmax + 1) ** 2
+    n_batch, n_focus = 5, 2
+    rng = np.random.default_rng(2026)
+
+    pt_mod = PTFrameContract(
+        lmax=lmax,
+        mmax=lmax,
+        coefficient_layout="packed",
+        n_frames=n_frames,
+        channels=channels,
+        dtype=torch.float64,
+        trainable=True,
+        seed=7,
+    ).to("cpu")
+    dp_mod = DPFrameContract(
+        lmax=lmax,
+        mmax=lmax,
+        coefficient_layout="packed",
+        n_frames=n_frames,
+        channels=channels,
+        precision="float64",
+        trainable=True,
+        seed=7,
+    )
+    _copy_weight(pt_mod, dp_mod)
+
+    coeff = rng.normal(size=(n_batch, coeff_dim, n_focus, n_frames * channels))
+    dp_out = dp_mod.call(coeff)
+    pt_out = pt_mod(torch.from_numpy(coeff))
+    assert dp_out.shape == (n_batch, coeff_dim, n_focus, channels)
+    np.testing.assert_allclose(
+        np.asarray(dp_out), pt_out.detach().cpu().numpy(), rtol=1e-12, atol=1e-12
+    )
+
+
+@pytest.mark.parametrize("lmax,channels,kmax", _CASES)  # degree, channels, kmax
+def test_frame_expand_parity(lmax, channels, kmax) -> None:
+    """The dpmodel ``FrameExpand`` matches pt with weight-copied fp64 weights."""
+    import torch
+
+    from deepmd.pt.model.descriptor.sezm_nn.grid_net import FrameExpand as PTFrameExpand
+
+    n_frames = 2 * kmax + 1
+    coeff_dim = (lmax + 1) ** 2
+    n_batch, n_focus = 5, 2
+    rng = np.random.default_rng(2027)
+
+    pt_mod = PTFrameExpand(
+        lmax=lmax,
+        mmax=lmax,
+        coefficient_layout="packed",
+        n_frames=n_frames,
+        channels=channels,
+        dtype=torch.float64,
+        trainable=True,
+        seed=11,
+    ).to("cpu")
+    dp_mod = DPFrameExpand(
+        lmax=lmax,
+        mmax=lmax,
+        coefficient_layout="packed",
+        n_frames=n_frames,
+        channels=channels,
+        precision="float64",
+        trainable=True,
+        seed=11,
+    )
+    _copy_weight(pt_mod, dp_mod)
+
+    coeff = rng.normal(size=(n_batch, coeff_dim, n_focus, channels))
+    dp_out = dp_mod.call(coeff)
+    pt_out = pt_mod(torch.from_numpy(coeff))
+    assert dp_out.shape == (n_batch, coeff_dim, n_focus, n_frames * channels)
+    np.testing.assert_allclose(
+        np.asarray(dp_out), pt_out.detach().cpu().numpy(), rtol=1e-12, atol=1e-12
+    )
+
+
+@pytest.mark.parametrize("cls", [DPFrameContract, DPFrameExpand])  # mixer class
+def test_serialize_roundtrip(cls) -> None:
+    """Serialize -> deserialize -> forward is identical; @version == 1."""
+    lmax, channels, n_frames = 2, 4, 3
+    coeff_dim = (lmax + 1) ** 2
+    n_batch, n_focus = 3, 2
+    rng = np.random.default_rng(505)
+
+    mod = cls(
+        lmax=lmax,
+        mmax=lmax,
+        coefficient_layout="packed",
+        n_frames=n_frames,
+        channels=channels,
+        precision="float64",
+        trainable=True,
+        seed=5,
+    )
+    # perturb to non-default weights
+    mod.weight = mod.weight + 0.1 * rng.normal(size=mod.weight.shape)
+
+    data = mod.serialize()
+    assert data["@version"] == 1
+    assert data["config"]["n_frames"] == n_frames
+    assert set(data["@variables"]) == {"weight"}
+    restored = cls.deserialize(data)
+    np.testing.assert_array_equal(restored.weight, mod.weight)
+
+    in_ch = mod.weight.shape[1]
+    coeff = rng.normal(size=(n_batch, coeff_dim, n_focus, in_ch))
+    out0 = mod.call(coeff)
+    out1 = restored.call(coeff)
+    np.testing.assert_allclose(
+        np.asarray(out0), np.asarray(out1), rtol=1e-12, atol=1e-12
+    )
+
+
+@pytest.mark.parametrize("lmax,mmax", [(2, 2), (3, 3), (3, 1)])  # degree, order
+@pytest.mark.parametrize("layout", ["packed", "m_major"])  # coefficient layout
+def test_degree_index(lmax, mmax, layout) -> None:
+    """``_build_frame_degree_index`` maps each (l, m) row to its degree l.
+
+    Compared against the pt helper output.
+    """
+    from deepmd.pt.model.descriptor.sezm_nn.grid_net import (
+        _build_frame_degree_index as pt_build,
+    )
+
+    dp_idx = _build_frame_degree_index(lmax=lmax, mmax=mmax, coefficient_layout=layout)
+    pt_idx = pt_build(lmax=lmax, mmax=mmax, coefficient_layout=layout)
+    np.testing.assert_array_equal(np.asarray(dp_idx), pt_idx.detach().cpu().numpy())
+    # explicit (l, m) check for the packed, untruncated case
+    if layout == "packed" and mmax == lmax:
+        expected = np.repeat(np.arange(lmax + 1), [2 * l + 1 for l in range(lmax + 1)])
+        np.testing.assert_array_equal(np.asarray(dp_idx), expected)
+
+
+@pytest.mark.parametrize("cls", [DPFrameContract, DPFrameExpand])  # mixer class
+def test_torch_namespace(cls) -> None:
+    """Mixer ``call`` on torch input matches the numpy-input result.
+
+    Array-API pitfall guard (no ``np.einsum`` on tensors).
+    """
+    import torch
+
+    lmax, channels, n_frames = 2, 4, 3
+    coeff_dim = (lmax + 1) ** 2
+    n_batch, n_focus = 3, 2
+    rng = np.random.default_rng(606)
+
+    mod = cls(
+        lmax=lmax,
+        mmax=lmax,
+        coefficient_layout="packed",
+        n_frames=n_frames,
+        channels=channels,
+        precision="float64",
+        trainable=True,
+        seed=9,
+    )
+    in_ch = mod.weight.shape[1]
+    coeff = rng.normal(size=(n_batch, coeff_dim, n_focus, in_ch))
+    np_out = mod.call(coeff)
+    torch_out = mod.call(torch.from_numpy(coeff))
+    np.testing.assert_allclose(
+        np.asarray(np_out),
+        torch_out.detach().cpu().numpy(),
+        rtol=1e-12,
+        atol=1e-12,
+    )
+
+
+@pytest.mark.parametrize(
+    "cls",
+    [
+        DPFrameContract,  # (N, D, F, K*C) -> (N, D, F, C)
+        DPFrameExpand,  # (N, D, F, C) -> (N, D, F, K*C)
+    ],
+)
+def test_empty_batch_passes_through(cls) -> None:
+    """An empty node axis yields ``(0, D, F, o)`` on every namespace.
+
+    Reachable when the cross-grid leading axis is an empty graph/edge set
+    or a distributed rank owns no nodes.
+    """
+    import torch
+
+    lmax, kmax, channels, n_focus = 2, 1, 4, 2
+    n_frames = 2 * kmax + 1
+    coeff_dim = (lmax + 1) ** 2
+    mod = cls(
+        lmax=lmax,
+        mmax=lmax,
+        coefficient_layout="packed",
+        n_frames=n_frames,
+        channels=channels,
+        precision="float64",
+        trainable=True,
+        seed=7,
+    )
+    in_dim = n_frames * channels if cls is DPFrameContract else channels
+    out_dim = channels if cls is DPFrameContract else n_frames * channels
+    coeff = np.zeros((0, coeff_dim, n_focus, in_dim), dtype=np.float64)
+    out = mod.call(coeff)
+    assert out.shape == (0, coeff_dim, n_focus, out_dim)
+    t_out = mod.call(torch.from_numpy(coeff))
+    assert tuple(t_out.shape) == (0, coeff_dim, n_focus, out_dim)
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "contract",  # (N, D, F, K*C) -> (N, D, F, C)
+        "expand",  # (N, D, F, C) -> (N, D, F, K*C)
+    ],
+)
+def test_focus_batched_lowering_matches_einsum_backward(kind) -> None:
+    """``F > 1`` forward AND backward parity of the ``(D, F)``-batched
+    lowering against the ``einsum("ndfi,dio->ndfo")`` contract, for the
+    input and the weight gradients.
+    """
+    import torch
+
+    lmax, kmax, channels = 2, 1, 4
+    n_frames = 2 * kmax + 1
+    coeff_dim = (lmax + 1) ** 2
+    n_batch, n_focus = 5, 2
+    rng = np.random.default_rng(2026)
+
+    if kind == "contract":
+        from deepmd.pt.model.descriptor.sezm_nn.grid_net import FrameContract as PTMixer
+
+        in_dim = n_frames * channels
+    else:
+        from deepmd.pt.model.descriptor.sezm_nn.grid_net import FrameExpand as PTMixer
+
+        in_dim = channels
+    pt_mod = PTMixer(
+        lmax=lmax,
+        mmax=lmax,
+        coefficient_layout="packed",
+        n_frames=n_frames,
+        channels=channels,
+        dtype=torch.float64,
+        trainable=True,
+        seed=7,
+    ).to("cpu")
+
+    coeff = torch.from_numpy(
+        rng.normal(size=(n_batch, coeff_dim, n_focus, in_dim))
+    ).requires_grad_(True)
+    out = pt_mod(coeff)
+    grad_out = torch.from_numpy(rng.normal(size=tuple(out.shape)))
+    out.backward(grad_out)
+    grad_in_mod = coeff.grad.detach().clone()
+    grad_w_mod = pt_mod.weight.grad.detach().clone()
+
+    pt_mod.weight.grad = None
+    coeff_ref = coeff.detach().clone().requires_grad_(True)
+    ref = torch.einsum(
+        "ndfi,dio->ndfo",
+        coeff_ref,
+        pt_mod.weight.index_select(0, pt_mod.degree_index),
+    )
+    np.testing.assert_allclose(
+        out.detach().numpy(), ref.detach().numpy(), rtol=1e-12, atol=1e-12
+    )
+    ref.backward(grad_out)
+    np.testing.assert_allclose(
+        grad_in_mod.numpy(), coeff_ref.grad.numpy(), rtol=1e-12, atol=1e-12
+    )
+    np.testing.assert_allclose(
+        grad_w_mod.numpy(), pt_mod.weight.grad.numpy(), rtol=1e-12, atol=1e-12
+    )
+
+    # the dpmodel spelling of the contraction agrees on the torch namespace,
+    # gradients included
+    from deepmd.dpmodel.array_api import (
+        xp_einsum,
+    )
+
+    coeff_dp = coeff.detach().clone().requires_grad_(True)
+    # leaf copy of the per-degree parameter: its gradient pins the dpmodel
+    # contraction's WEIGHT backward too, not only the input backward
+    weight_dp = pt_mod.weight.detach().clone().requires_grad_(True)
+    dp_out = xp_einsum(
+        "ndfi,dio->ndfo",
+        coeff_dp,
+        weight_dp.index_select(0, pt_mod.degree_index),
+    )
+    np.testing.assert_allclose(
+        dp_out.detach().numpy(), out.detach().numpy(), rtol=1e-12, atol=1e-12
+    )
+    dp_out.backward(grad_out)
+    np.testing.assert_allclose(
+        coeff_dp.grad.numpy(), grad_in_mod.numpy(), rtol=1e-12, atol=1e-12
+    )
+    np.testing.assert_allclose(
+        weight_dp.grad.numpy(), grad_w_mod.numpy(), rtol=1e-12, atol=1e-12
+    )
+
+    # The namespaces without a native einsum reach the same contraction
+    # through the array-API fallback, which is the only lowering left that
+    # could drift from the contract.
+    from deepmd.dpmodel.array_api import (
+        _xp_einsum_fallback,
+    )
+
+    coeff_fb = coeff.detach().clone().requires_grad_(True)
+    weight_fb = pt_mod.weight.detach().clone().requires_grad_(True)
+    fb_out = _xp_einsum_fallback(
+        "ndfi,dio->ndfo",
+        coeff_fb,
+        weight_fb.index_select(0, pt_mod.degree_index),
+    )
+    np.testing.assert_allclose(
+        fb_out.detach().numpy(), out.detach().numpy(), rtol=1e-12, atol=1e-12
+    )
+    fb_out.backward(grad_out)
+    np.testing.assert_allclose(
+        coeff_fb.grad.numpy(), grad_in_mod.numpy(), rtol=1e-12, atol=1e-12
+    )
+    np.testing.assert_allclose(
+        weight_fb.grad.numpy(), grad_w_mod.numpy(), rtol=1e-12, atol=1e-12
+    )

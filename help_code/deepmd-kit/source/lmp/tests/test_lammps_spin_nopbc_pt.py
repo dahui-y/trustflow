@@ -1,0 +1,230 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
+import importlib
+import os
+import shutil
+from pathlib import (
+    Path,
+)
+
+import numpy as np
+import pytest
+from lammps import (
+    PyLammps,
+)
+from lammps_test_utils import (
+    make_spin_lammps,
+    run_mpi_model_deviation,
+)
+from model_convert import (
+    ensure_converted_pb,
+)
+from write_lmp_data import (
+    write_lmp_data_spin,
+)
+
+pbtxt_file2 = (
+    Path(__file__).parent.parent.parent / "tests" / "infer" / "deepspin_nlist-2.pbtxt"
+)
+pb_file = (
+    Path(__file__).parent.parent.parent / "tests" / "infer" / "deeppot_dpa_spin.pth"
+)
+pb_file2 = Path(__file__).parent / "deepspin_nlist-2.pb"
+system_file = Path(__file__).parent.parent.parent / "tests"
+data_file = Path(__file__).parent / "data.lmp"
+data_file_si = Path(__file__).parent / "data.si"
+data_type_map_file = Path(__file__).parent / "data_type_map.lmp"
+md_file = Path(__file__).parent / "md.out"
+
+expected_e = 3.5101080091096860e-01
+expected_f = np.array(
+    [
+        [3.9007324220254663e-03, -1.6340906092268837e-03, 2.4784543132550553e-03],
+        [-3.9007324220254660e-03, 1.6340906092268837e-03, -2.4784543132550550e-03],
+        [1.0879565176984952e-04, 1.0163804310078055e-04, -1.4887826031663627e-04],
+        [-1.0879565176984952e-04, -1.0163804310078055e-04, 1.4887826031663627e-04],
+    ]
+)
+expected_fm = np.array(
+    [
+        [3.4589594972289518e-03, -1.4490235731634794e-03, 2.3561281037953720e-03],
+        [-3.0400436796538990e-04, 1.2735318117469008e-04, -1.4949786028183132e-03],
+        [0.0000000000000000e00, 0.0000000000000000e00, 0.0000000000000000e00],
+        [0.0000000000000000e00, 0.0000000000000000e00, 0.0000000000000000e00],
+    ]
+)
+
+expected_f2 = np.array(
+    [
+        [-0.0020912362538459, 0.0008760584306652, -0.0002029714364812],
+        [0.0020912362538459, -0.0008760584306652, 0.0002029714364812],
+        [0.0020348523962324, 0.0019009805280592, -0.0027845348580022],
+        [-0.0020348523962324, -0.0019009805280592, 0.0027845348580022],
+    ]
+)
+
+expected_fm2 = np.array(
+    [
+        [0.0020796789544968, -0.0008712168593162, 0.0269545489546998],
+        [-0.0031170434556743, 0.0013057884746744, 0.0295063550138163],
+        [0.0000000000000000, 0.00000000000000000, 0.00000000000000000],
+        [0.0000000000000000, 0.00000000000000000, 0.00000000000000000],
+    ]
+)
+
+box = np.array([0, 100, 0, 100, 0, 100, 0, 0, 0])
+coord = np.array(
+    [
+        [12.83, 2.56, 2.18],
+        [12.09, 2.87, 2.74],
+        [3.51, 2.51, 2.60],
+        [4.27, 3.22, 1.56],
+    ]
+)
+spin = np.array(
+    [
+        [0, 0, 1.2737],
+        [0, 0, 1.2737],
+        [0, 0, 0],
+        [0, 0, 0],
+    ]
+)
+type_NiO = np.array([1, 1, 2, 2])
+
+
+def setup_module() -> None:
+    if os.environ.get("ENABLE_PYTORCH", "1") != "1":
+        pytest.skip(
+            "Skip test because PyTorch support is not enabled.",
+        )
+    if os.environ.get("ENABLE_TENSORFLOW", "1") == "1":
+        ensure_converted_pb(pbtxt_file2, pb_file2)
+
+    write_lmp_data_spin(box, coord, spin, type_NiO, data_file)
+
+
+def teardown_module() -> None:
+    os.remove(data_file)
+
+
+def _lammps(data_file, units="metal") -> PyLammps:
+    return make_spin_lammps(data_file, units, boundary="f f f")
+
+
+@pytest.fixture
+def lammps():
+    lmp = _lammps(data_file=data_file)
+    yield lmp
+    lmp.close()
+
+
+def test_pair_deepmd(lammps) -> None:
+    lammps.pair_style(f"deepspin {pb_file.resolve()}")
+    lammps.pair_coeff("* *")
+    lammps.run(0)
+    assert lammps.eval("pe") == pytest.approx(expected_e)
+    for ii in range(4):
+        assert lammps.atoms[ii].force == pytest.approx(
+            expected_f[lammps.atoms[ii].id - 1]
+        )
+    lammps.run(1)
+
+
+@pytest.mark.skipif(
+    os.environ.get("ENABLE_TENSORFLOW", "1") != "1",
+    reason="Skip test because TensorFlow support is not enabled.",
+)
+def test_pair_deepmd_model_devi(lammps) -> None:
+    lammps.pair_style(
+        f"deepspin {pb_file.resolve()} {pb_file2.resolve()} out_file {md_file.resolve()} out_freq 1"
+    )
+    lammps.pair_coeff("* *")
+    lammps.run(0)
+    assert lammps.eval("pe") == pytest.approx(expected_e)
+    for ii in range(4):
+        assert lammps.atoms[ii].force == pytest.approx(
+            expected_f[lammps.atoms[ii].id - 1]
+        )
+    # load model devi
+    md = np.loadtxt(md_file.resolve())
+    expected_md_f = np.linalg.norm(np.std([expected_f, expected_f2], axis=0), axis=1)
+    expected_md_fm = np.linalg.norm(np.std([expected_fm, expected_fm2], axis=0), axis=1)
+    assert md[4] == pytest.approx(np.max(expected_md_f))
+    assert md[5] == pytest.approx(np.min(expected_md_f))
+    assert md[6] == pytest.approx(np.mean(expected_md_f))
+    assert md[7] == pytest.approx(np.max(expected_md_fm))
+    assert md[8] == pytest.approx(np.min(expected_md_fm))
+    assert md[9] == pytest.approx(np.mean(expected_md_fm))
+
+
+@pytest.mark.skipif(
+    os.environ.get("ENABLE_TENSORFLOW", "1") != "1",
+    reason="Skip test because TensorFlow support is not enabled.",
+)
+def test_pair_deepmd_model_devi_atomic_relative(lammps) -> None:
+    relative = 1.0
+    lammps.pair_style(
+        f"deepspin {pb_file.resolve()} {pb_file2.resolve()} out_file {md_file.resolve()} out_freq 1 atomic relative {relative}"
+    )
+    lammps.pair_coeff("* *")
+    lammps.run(0)
+    assert lammps.eval("pe") == pytest.approx(expected_e)
+    for ii in range(4):
+        assert lammps.atoms[ii].force == pytest.approx(
+            expected_f[lammps.atoms[ii].id - 1]
+        )
+    # load model devi
+    md = np.loadtxt(md_file.resolve())
+    norm = np.linalg.norm(np.mean([expected_f, expected_f2], axis=0), axis=1)
+    norm_spin = np.linalg.norm(np.mean([expected_fm, expected_fm2], axis=0), axis=1)
+    expected_md_f = np.linalg.norm(np.std([expected_f, expected_f2], axis=0), axis=1)
+    expected_md_f /= norm + relative
+    expected_md_fm = np.linalg.norm(np.std([expected_fm, expected_fm2], axis=0), axis=1)
+    expected_md_fm /= norm_spin + relative
+    assert md[4] == pytest.approx(np.max(expected_md_f))
+    assert md[5] == pytest.approx(np.min(expected_md_f))
+    assert md[6] == pytest.approx(np.mean(expected_md_f))
+    assert md[7] == pytest.approx(np.max(expected_md_fm))
+    assert md[8] == pytest.approx(np.min(expected_md_fm))
+    assert md[9] == pytest.approx(np.mean(expected_md_fm))
+
+
+@pytest.mark.skipif(
+    shutil.which("mpirun") is None, reason="MPI is not installed on this system"
+)
+@pytest.mark.skipif(
+    importlib.util.find_spec("mpi4py") is None, reason="mpi4py is not installed"
+)
+@pytest.mark.parametrize(
+    ("balance_args",),
+    [(["--balance"],), ([],)],
+)
+@pytest.mark.skipif(
+    os.environ.get("ENABLE_TENSORFLOW", "1") != "1",
+    reason="Skip test because TensorFlow support is not enabled.",
+)
+def test_pair_deepmd_mpi(balance_args: list) -> None:
+    pe = run_mpi_model_deviation(
+        Path(__file__).parent / "run_mpi_pair_deepmd_spin.py",
+        data_file,
+        pb_file,
+        pb_file2,
+        md_file,
+        extra_args=[*balance_args, "--nopbc"],
+    )
+
+    relative = 1.0
+    assert pe == pytest.approx(expected_e)
+    # load model devi
+    md = np.loadtxt(md_file.resolve())
+    norm = np.linalg.norm(np.mean([expected_f, expected_f2], axis=0), axis=1)
+    norm_spin = np.linalg.norm(np.mean([expected_fm, expected_fm2], axis=0), axis=1)
+    expected_md_f = np.linalg.norm(np.std([expected_f, expected_f2], axis=0), axis=1)
+    expected_md_f /= norm + relative
+    expected_md_fm = np.linalg.norm(np.std([expected_fm, expected_fm2], axis=0), axis=1)
+    expected_md_fm /= norm_spin + relative
+    assert md[4] == pytest.approx(np.max(expected_md_f))
+    assert md[5] == pytest.approx(np.min(expected_md_f))
+    assert md[6] == pytest.approx(np.mean(expected_md_f))
+    assert md[7] == pytest.approx(np.max(expected_md_fm))
+    assert md[8] == pytest.approx(np.min(expected_md_fm))
+    assert md[9] == pytest.approx(np.mean(expected_md_fm))

@@ -1,0 +1,145 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
+from abc import (
+    ABC,
+    abstractmethod,
+)
+from typing import (
+    Any,
+    NoReturn,
+)
+
+from deepmd.common import (
+    j_get_type,
+)
+from deepmd.dpmodel.output_def import (
+    FittingOutputDef,
+)
+from deepmd.utils.plugin import (
+    PluginVariant,
+    make_plugin_registry,
+)
+
+
+def make_base_fitting(
+    t_tensor: Any,
+    fwd_method_name: str = "forward",
+) -> type:
+    """Make the base class for the fitting.
+
+    Parameters
+    ----------
+    t_tensor
+        The type of the tensor. used in the type hint.
+    fwd_method_name
+        Name of the forward method. For dpmodels, it should be "call".
+        For torch models, it should be "forward".
+
+    """
+
+    class BF(ABC, PluginVariant, make_plugin_registry("fitting")):
+        """Base fitting provides the interfaces of fitting net."""
+
+        vacuum_ref: bool = False
+        """Whether every atom is referenced to the isolated atom of its type.
+
+        A fitting that sets it takes the vacuum descriptor of every type in
+        its forward; the default holds for fittings without the option.
+        """
+
+        def needs_vacuum_descriptor(self) -> bool:
+            """Whether the forward takes the vacuum descriptor of every type from the descriptor."""
+            return False
+
+        def __new__(cls: type, *args: Any, **kwargs: Any) -> Any:
+            if cls is BF:
+                cls = cls.get_class_by_type(j_get_type(kwargs, cls.__name__))
+            return object.__new__(cls)
+
+        @abstractmethod
+        def output_def(self) -> FittingOutputDef:
+            """Returns the output def of the fitting net."""
+            pass
+
+        @abstractmethod
+        def fwd(
+            self,
+            descriptor: t_tensor,
+            atype: t_tensor,
+            gr: t_tensor | None = None,
+            g2: t_tensor | None = None,
+            h2: t_tensor | None = None,
+            fparam: t_tensor | None = None,
+            aparam: t_tensor | None = None,
+        ) -> dict[str, t_tensor]:
+            """Calculate fitting."""
+            pass
+
+        def compute_output_stats(self, merged: Any) -> NoReturn:
+            """Update the output bias for fitting net."""
+            raise NotImplementedError
+
+        def reinit_exclude(self, exclude_types: list[int] = []) -> None:
+            """Reinitialize the per-type output exclusion list.
+
+            Concrete default for fittings without exclusion support: an
+            empty list is a no-op; a non-empty list raises, because
+            silently ignoring a requested exclusion would degrade the
+            model without any signal.
+
+            Parameters
+            ----------
+            exclude_types
+                Atom types whose fitting output is excluded.
+
+            Raises
+            ------
+            NotImplementedError
+                If ``exclude_types`` is non-empty and this fitting does
+                not support atom-type exclusion.
+            """
+            if exclude_types:
+                raise NotImplementedError(
+                    "this fitting does not support atom-type exclusion"
+                )
+
+        @abstractmethod
+        def get_type_map(self) -> list[str]:
+            """Get the name to each type of atoms."""
+            pass
+
+        @abstractmethod
+        def change_type_map(
+            self, type_map: list[str], model_with_new_type_stat: Any | None = None
+        ) -> None:
+            """Change the type related params to new ones, according to `type_map` and the original one in the model.
+            If there are new types in `type_map`, statistics will be updated accordingly to `model_with_new_type_stat` for these new types.
+            """
+            pass
+
+        @abstractmethod
+        def serialize(self) -> dict:
+            """Serialize the obj to dict."""
+            pass
+
+        @classmethod
+        def deserialize(cls, data: dict) -> "BF":
+            """Deserialize the fitting.
+
+            Parameters
+            ----------
+            data : dict
+                The serialized data
+
+            Returns
+            -------
+            BF
+                The deserialized fitting
+            """
+            if cls is BF:
+                return BF.get_class_by_type(data["type"]).deserialize(data)
+            raise NotImplementedError(f"Not implemented in class {cls.__name__}")
+
+    setattr(BF, fwd_method_name, BF.fwd)
+    delattr(BF, "fwd")
+
+    return BF

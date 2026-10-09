@@ -1,0 +1,669 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
+"""Utilities for the array API."""
+
+import math
+from typing import (
+    Any,
+)
+
+import array_api_compat
+import numpy as np
+from packaging.version import (
+    Version,
+)
+
+from deepmd.dpmodel.common import (
+    to_numpy_array,
+)
+
+# Type alias for array_api compatible arrays
+Array = np.ndarray | Any  # Any to support JAX, PyTorch, etc. arrays
+
+
+def xp_asarray_nodetach(
+    xp: Any,
+    obj: Any,
+    *,
+    dtype: Any = None,
+    device: Any = None,
+) -> Array:
+    """``xp.asarray`` that preserves autograd for backend tensors.
+
+    ``torch.asarray`` detaches its input from the autograd graph, so calling
+    ``xp.asarray`` on a weight attribute that is already a backend tensor
+    (e.g. a ``torch.nn.Parameter`` registered by the pt_expt backend)
+    silently breaks gradient flow to that weight. Backend tensors already in
+    ``xp`` are therefore returned as-is, with an optional differentiable dtype
+    cast via ``xp.astype``.
+
+    An array from another namespace cannot retain its autograd graph. It is
+    converted through NumPy before entering ``xp``; this also performs the
+    required device-to-host copy when a CUDA-backed model constant is consumed
+    by a NumPy statistics path.
+
+    An array already in ``xp`` normally needs no move, since model buffers and
+    inputs travel together. Tracing breaks that: a CPU export of a
+    CUDA-resident model runs CPU inputs through a module whose buffers stayed
+    on the device, and the mismatch surfaces far downstream as a fake-tensor
+    device error. A requested ``device`` that differs is therefore honoured
+    here, which costs a comparison on the hot path and a copy only in the
+    tracing case.
+    """
+    if array_api_compat.is_array_api_obj(obj):
+        if array_api_compat.array_namespace(obj) is xp:
+            if dtype is not None and obj.dtype != dtype:
+                obj = xp.astype(obj, dtype)
+            if device is not None and array_api_compat.device(obj) != device:
+                # ``xp.asarray`` would detach, which is what this helper exists
+                # to avoid; ``to_device`` is the array-API move that does not.
+                obj = array_api_compat.to_device(obj, device)
+            return obj
+        obj = to_numpy_array(obj)
+    if dtype is None:
+        return xp.asarray(obj, device=device)
+    return xp.asarray(obj, dtype=dtype, device=device)
+
+
+# array api adds take_along_axis in https://github.com/data-apis/array-api/pull/816
+# but it hasn't been released yet
+# below is a pure Python implementation of take_along_axis
+# https://github.com/data-apis/array-api/issues/177#issuecomment-2093630595
+def xp_swapaxes(a: Array, axis1: int, axis2: int) -> Array:
+    xp = array_api_compat.array_namespace(a)
+    axes = list(range(a.ndim))
+    axes[axis1], axes[axis2] = axes[axis2], axes[axis1]
+    a = xp.permute_dims(a, axes)
+    return a
+
+
+def xp_take_along_axis(arr: Array, indices: Array, axis: int) -> Array:
+    xp = array_api_compat.array_namespace(arr)
+    # torch.take_along_dim requires int64 indices
+    if array_api_compat.is_torch_array(indices):
+        indices = xp.astype(indices, xp.int64)
+    if array_api_compat.is_torch_array(arr):
+        # Use torch.gather directly for torch.export dynamic shape compatibility.
+        # array_api_compat's take_along_axis / torch.take_along_dim specializes
+        # the source dimension size to a constant during torch.export tracing,
+        # breaking dynamic shape export.  torch.gather is the underlying
+        # primitive and handles symbolic shapes correctly.
+        import torch
+
+        return torch.gather(arr, axis, indices)
+    if Version(xp.__array_api_version__) >= Version("2024.12"):
+        # see: https://github.com/data-apis/array-api-strict/blob/d086c619a58f35c38240592ef994aa19ca7beebc/array_api_strict/_indexing_functions.py#L30-L39
+        return xp.take_along_axis(arr, indices, axis=axis)
+    arr = xp_swapaxes(arr, axis, -1)
+    indices = xp_swapaxes(indices, axis, -1)
+
+    m = arr.shape[-1]
+    n = indices.shape[-1]
+
+    shape = list(arr.shape)
+    shape.pop(-1)
+    shape = (*shape, n)
+
+    arr = xp.reshape(arr, (-1,))
+    if n != 0:
+        indices = xp.reshape(indices, (-1, n))
+    else:
+        indices = xp.reshape(indices, (0, 0))
+
+    dev = array_api_compat.device(indices)
+    offset = (xp.arange(indices.shape[0], dtype=indices.dtype, device=dev) * m)[
+        :, xp.newaxis
+    ]
+    indices = xp.reshape(offset + indices, (-1,))
+
+    out = xp.take(arr, indices)
+    out = xp.reshape(out, shape)
+    return xp_swapaxes(out, axis, -1)
+
+
+def xp_einsum(subscripts: str, *operands: Array) -> Array:
+    """Contract *operands* according to the Einstein summation *subscripts*.
+
+    The array API standard has no ``einsum``, so an array-API-only module has
+    to express a contraction as a chain of ``permute_dims`` / ``reshape`` /
+    ``matmul``. That chain fixes one particular execution order, which is
+    rarely the best one and is opaque to a compiler: a batched contraction
+    written this way reaches PyTorch as ``bmm`` plus transposing copies, where
+    the same expression given to ``torch.einsum`` is free to become a single
+    ``mm`` on a reshaped operand or to fuse into a neighbouring kernel. On the
+    production DPA4 shapes the difference is measurable -- the array-API chain
+    put roughly 150 more contractions per training step on ``bmm`` instead of
+    ``mm``, for about 5% of the step and an extra gigabyte of peak memory.
+
+    Writing the chain by hand is also a correctness-adjacent hazard, because
+    the orders differ by more than a constant. The broadcast spelling
+    ``matmul(x[..., None, :], weight[None, ...])`` makes the node count the
+    matmul batch, so the weight is expanded across it and autograd reduces
+    that whole expansion back to the parameter shape: at production sizes a
+    165 K-element weight became 191 M elements, and its reduce was the single
+    costliest kernel of a training step (a 15x penalty on the affected
+    contraction). Stating the contraction leaves that choice to the backend.
+
+    Every backend this project targets (NumPy, PyTorch, JAX) ships an
+    ``einsum``, so it is dispatched directly where available. The array-API
+    fallback below serves the remaining namespaces (``array_api_strict``, used
+    by the conformance tests) and is restricted to what those need.
+
+    Parameters
+    ----------
+    subscripts : str
+        Subscript specification in explicit form, e.g. ``"bfi,ifo->bfo"``.
+        The implicit form (no ``->``) is rejected: it is ambiguous to the
+        fallback and unused here.
+    *operands : Array
+        Arrays to contract, all from one namespace.
+
+    Returns
+    -------
+    Array
+        The contraction result.
+
+    Raises
+    ------
+    ValueError
+        If *subscripts* is in implicit form, or if the fallback is reached
+        with a specification it does not implement.
+    """
+    if "->" not in subscripts:
+        raise ValueError(f"xp_einsum requires an explicit output: {subscripts!r}")
+    if array_api_compat.is_torch_array(operands[0]):
+        import torch
+
+        return torch.einsum(subscripts, *operands)
+    if array_api_compat.is_numpy_array(operands[0]):
+        return np.einsum(subscripts, *operands)
+    if array_api_compat.is_jax_array(operands[0]):
+        import jax.numpy as jnp
+
+        return jnp.einsum(subscripts, *operands)
+    return _xp_einsum_fallback(subscripts, *operands)
+
+
+def _xp_einsum_fallback(subscripts: str, *operands: Array) -> Array:
+    """Array-API-only ``einsum`` for a two-operand contraction.
+
+    Serves the namespaces without a native ``einsum``. The contraction is
+    reduced to the canonical batched matmul: labels shared by both operands
+    and the output are the batch, labels shared by the operands but absent
+    from the output are contracted, and the rest are free on one side each.
+    Each operand is permuted into ``(batch, free, contracted)`` order,
+    flattened to three axes, multiplied, and restored to the requested output
+    order.
+
+    Correctness rather than throughput is the aim here: the flattening
+    materializes a copy of each operand whenever the permutation is not a
+    view, which a native ``einsum`` would avoid. That trade is deliberate --
+    every backend used for production has an ``einsum``, and this path exists
+    for the conformance namespaces.
+
+    Only a diagonal (a label repeated within one operand) and an implicit
+    output are rejected; both are absent from this codebase.
+    """
+    xp = array_api_compat.array_namespace(*operands)
+    inputs, output = subscripts.split("->")
+    terms = inputs.split(",")
+    if len(terms) != 2:
+        raise ValueError(f"the array-API einsum fallback is binary: {subscripts!r}")
+    left, right = terms
+    lhs, rhs = operands
+    for term, operand in ((left, lhs), (right, rhs)):
+        if len(set(term)) != len(term):
+            raise ValueError(f"a repeated label needs a diagonal: {subscripts!r}")
+        if len(term) != operand.ndim:
+            raise ValueError(f"{subscripts!r} does not match the operand ranks")
+    if set(output) - (set(left) | set(right)):
+        raise ValueError(f"the output carries an unknown label: {subscripts!r}")
+
+    # Classify every label by where it appears. Order follows the output for
+    # the batch and free groups, so the final permutation is a short one.
+    batch = [label for label in output if label in left and label in right]
+    contracted = [label for label in left if label in right and label not in output]
+    left_free = [label for label in output if label in left and label not in right]
+    right_free = [label for label in output if label in right and label not in left]
+    if set(left) - set(batch) - set(contracted) - set(left_free):
+        raise ValueError(f"a label of the left operand vanishes: {subscripts!r}")
+    if set(right) - set(batch) - set(contracted) - set(right_free):
+        raise ValueError(f"a label of the right operand vanishes: {subscripts!r}")
+
+    def prepare(term: str, operand: Array, free: list[str], last: list[str]) -> Array:
+        """Permute to ``(batch, free, last)`` and flatten to three axes."""
+        order = batch + free + last
+        operand = xp.permute_dims(operand, tuple(term.index(l) for l in order))
+        shape = operand.shape
+        split = (len(batch), len(batch) + len(free))
+        return xp.reshape(
+            operand,
+            (
+                math.prod(shape[: split[0]]),
+                math.prod(shape[split[0] : split[1]]),
+                math.prod(shape[split[1] :]),
+            ),
+        )
+
+    sizes = dict(zip(left, lhs.shape, strict=True)) | dict(
+        zip(right, rhs.shape, strict=True)
+    )
+    out = xp.matmul(
+        prepare(left, lhs, left_free, contracted),
+        prepare(right, rhs, contracted, right_free),
+    )
+    order = batch + left_free + right_free
+    out = xp.reshape(out, tuple(sizes[label] for label in order))
+    return xp.permute_dims(out, tuple(order.index(label) for label in output))
+
+
+def xp_take_first_n(arr: Array, dim: int, n: int) -> Array:
+    """Take the first *n* elements along *dim*.
+
+    For torch tensors, uses ``torch.index_select`` so that
+    ``torch.export`` does not emit a contiguity guard that would
+    prevent the ``nall == nloc`` (no-PBC) case from working.
+    For numpy / jax, uses regular slicing.
+    """
+    if array_api_compat.is_torch_array(arr):
+        import torch
+
+        indices = torch.arange(n, dtype=torch.int64, device=arr.device)
+        return torch.index_select(arr, dim, indices)
+    slices = [slice(None)] * arr.ndim
+    slices[dim] = slice(0, n)
+    return arr[tuple(slices)]
+
+
+def xp_scatter_sum(input: Array, dim: int, index: Array, src: Array) -> Array:
+    """Reduces all values from the src tensor to the indices specified in the index tensor.
+
+    This function is similar to PyTorch's scatter_add and JAX's scatter_sum.
+    It adds values from src to input at positions specified by index along the given dimension.
+    """
+    if array_api_compat.is_torch_array(input):
+        # PyTorch: use scatter_add (non-mutating version) for better performance
+        import torch
+
+        return torch.scatter_add(input, dim, index, src)
+
+    # Generic array_api implementation (works for JAX, NumPy, array-api-strict, etc.)
+    xp = array_api_compat.array_namespace(input)
+    if getattr(xp, "__name__", "") == "deepmd._vendors.ndtensorflow":
+        import tensorflow as tf
+
+        input_tensor = input.unwrap()
+        index_tensor = tf.cast(index.unwrap(), tf.int64)
+        src_tensor = src.unwrap()
+        rank = input_tensor.shape.rank
+        if rank is None:
+            raise ValueError("xp_scatter_sum requires a statically known rank")
+        dim = dim + rank if dim < 0 else dim
+        src_shape = tf.shape(src_tensor, out_type=tf.int64)
+        coords = []
+        for axis in range(rank):
+            if axis == dim:
+                coord = index_tensor
+            else:
+                view_shape = [1] * rank
+                view_shape[axis] = src_shape[axis]
+                coord = tf.broadcast_to(
+                    tf.reshape(tf.range(src_shape[axis], dtype=tf.int64), view_shape),
+                    src_shape,
+                )
+            coords.append(coord)
+        scatter_indices = tf.reshape(tf.stack(coords, axis=-1), (-1, rank))
+        scatter_updates = tf.reshape(src_tensor, (-1,))
+        scattered = tf.scatter_nd(
+            scatter_indices,
+            scatter_updates,
+            tf.shape(input_tensor, out_type=tf.int64),
+        )
+        return xp.asarray(input_tensor + scattered)
+
+    # Create flat index array matching input shape
+    idx = xp.arange(input.size, dtype=xp.int64, device=array_api_compat.device(input))
+    idx = xp.reshape(idx, input.shape)
+
+    # Get flat indices where we want to add values
+    new_idx = xp_take_along_axis(idx, index, axis=dim)
+    new_idx = xp.reshape(new_idx, (-1,))
+
+    # Flatten arrays
+    shape = input.shape
+    input_flat = xp.reshape(input, (-1,))
+    src_flat = xp.reshape(src, (-1,))
+
+    # Add values at the specified indices
+    result = xp_add_at(input_flat, new_idx, src_flat)
+
+    # Reshape back to original shape
+    return xp.reshape(result, shape)
+
+
+def xp_add_at(x: Array, indices: Array, values: Array) -> Array:
+    """Adds values to the specified indices of x in place or returns new x (for JAX)."""
+    xp = array_api_compat.array_namespace(x, indices, values)
+    if array_api_compat.is_numpy_array(x):
+        # NumPy: supports np.add.at (in-place)
+        xp.add.at(x, indices, values)
+        return x
+
+    elif array_api_compat.is_jax_array(x):
+        # JAX: functional update, not in-place
+        return x.at[indices].add(values)
+    elif array_api_compat.is_torch_array(x):
+        # PyTorch: use index_add (non-mutating version)
+        import torch
+
+        return torch.index_add(x, 0, indices, values)
+    elif getattr(xp, "__name__", "") == "deepmd._vendors.ndtensorflow":
+        import tensorflow as tf
+
+        x_tensor = x.unwrap()
+        indices_tensor = tf.reshape(tf.cast(indices.unwrap(), tf.int64), (-1,))
+        values_tensor = values.unwrap()
+        # unsorted_segment_sum rather than scatter_nd: both accumulate repeated
+        # indices, but scatter_nd rejects a destination with no elements even
+        # when the updates are empty too, which a descriptor call with zero
+        # edges legitimately produces.
+        updates = tf.math.unsorted_segment_sum(
+            values_tensor,
+            indices_tensor,
+            tf.shape(x_tensor, out_type=tf.int64)[0],
+        )
+        return xp.asarray(x_tensor + updates)
+    else:
+        # Fallback for array_api_strict: use basic indexing only
+        # may need a more efficient way to do this
+        n = indices.shape[0]
+        for i in range(n):
+            idx = int(indices[i])
+            x[idx, ...] = x[idx, ...] + values[i, ...]
+        return x
+
+
+def xp_hint_dynamic_size(x: Array) -> None:
+    """Mark a data-dependent leading dimension as a valid size for torch.export.
+
+    Under symbolic tracing (``make_fx`` / ``torch.export``) the length of a
+    data-dependent array (e.g. the output of ``nonzero`` or a tensor-``repeat``)
+    is an UNBACKED SymInt; guarding Python control flow or allocations on it
+    raises ``GuardOnDataDependentSymNode``. ``torch._check_is_size`` registers
+    the ``>= 0`` size hint that lets the tracer treat it as a proper dimension
+    (recorded as a ``sym_constrain_range_for_size`` node, preserved by AOTI).
+
+    No-op for numpy / jax / eager-torch concrete shapes — safe to call
+    unconditionally from dpmodel code (torch imported lazily, torch arrays only).
+    """
+    if array_api_compat.is_torch_array(x):
+        import torch
+
+        torch._check_is_size(x.shape[0])
+
+
+def xp_maximum_at(x: Array, indices: Array, values: Array) -> Array:
+    """Segment max-assign of values into x at the specified indices.
+
+    Element-wise analogue of :func:`xp_add_at` that takes the maximum instead
+    of the sum: for every ``k`` it assigns ``x[indices[k]] = maximum(
+    x[indices[k]], values[k])``. Repeated indices reduce to the per-segment
+    maximum, which is order-independent.
+
+    Parameters
+    ----------
+    x : Array
+        Destination array indexed along axis 0; typically pre-filled with
+        ``-inf`` so empty segments stay neutral.
+    indices : Array
+        Integer destination indices with shape (K,).
+    values : Array
+        Source values with shape (K, *x.shape[1:]).
+
+    Returns
+    -------
+    Array
+        The updated array (modified in place and returned for NumPy; a new
+        array for JAX/PyTorch).
+    """
+    xp = array_api_compat.array_namespace(x, indices, values)
+    if array_api_compat.is_numpy_array(x):
+        # NumPy: in-place ufunc reduction at the given indices.
+        xp.maximum.at(x, indices, values)
+        return x
+
+    elif array_api_compat.is_jax_array(x):
+        # JAX: functional indexed-max update, not in-place.
+        return x.at[indices].max(values)
+    elif array_api_compat.is_torch_array(x):
+        import torch
+
+        index = indices.reshape([-1] + [1] * (values.ndim - 1)).expand_as(values)
+        return torch.scatter_reduce(
+            x, 0, index, values, reduce="amax", include_self=True
+        )
+    elif getattr(xp, "__name__", "") == "deepmd._vendors.ndtensorflow":
+        import tensorflow as tf
+
+        x_tensor = x.unwrap()
+        indices_tensor = tf.reshape(tf.cast(indices.unwrap(), tf.int64), (-1,))
+        values_tensor = values.unwrap()
+        reduced = tf.math.unsorted_segment_max(
+            values_tensor,
+            indices_tensor,
+            tf.shape(x_tensor, out_type=tf.int64)[0],
+        )
+        if values_tensor.dtype.is_floating:
+            # TensorFlow uses the lowest finite value as the identity of
+            # unsorted_segment_max. Restore the true maximum-at identity when
+            # every update for a touched segment element is negative infinity.
+            all_negative_infinity = (
+                tf.math.unsorted_segment_min(
+                    tf.cast(
+                        tf.math.is_inf(values_tensor) & (values_tensor < 0),
+                        tf.int32,
+                    ),
+                    indices_tensor,
+                    tf.shape(x_tensor, out_type=tf.int64)[0],
+                )
+                > 0
+            )
+            reduced = tf.where(
+                all_negative_infinity,
+                tf.cast(float("-inf"), values_tensor.dtype),
+                reduced,
+            )
+        segment_counts = tf.math.unsorted_segment_sum(
+            tf.ones_like(indices_tensor, dtype=tf.int32),
+            indices_tensor,
+            tf.shape(x_tensor, out_type=tf.int64)[0],
+        )
+        touched = segment_counts > 0
+        touched_shape = tf.concat(
+            [
+                tf.reshape(tf.shape(x_tensor, out_type=tf.int64)[0], (1,)),
+                tf.ones(tf.rank(x_tensor) - 1, dtype=tf.int64),
+            ],
+            axis=0,
+        )
+        touched = tf.reshape(touched, touched_shape)
+        return xp.asarray(tf.where(touched, tf.maximum(x_tensor, reduced), x_tensor))
+    else:
+        # Fallback for array_api_strict: basic indexing only.
+        n = indices.shape[0]
+        for i in range(n):
+            idx = int(indices[i])
+            x[idx, ...] = xp.maximum(x[idx, ...], values[i, ...])
+        return x
+
+
+def xp_sigmoid(x: Array) -> Array:
+    """Compute the sigmoid function.
+
+    JAX and PyTorch have optimized sigmoid implementations.
+    See https://github.com/jax-ml/jax/discussions/15617
+    """
+    if array_api_compat.is_jax_array(x):
+        from deepmd.jax.env import (
+            jax,
+        )
+
+        return jax.nn.sigmoid(x)
+    elif array_api_compat.is_torch_array(x):
+        import torch
+
+        return torch.sigmoid(x)
+    xp = array_api_compat.array_namespace(x)
+    return 1 / (1 + xp.exp(-x))
+
+
+def xp_erf(x: Array) -> Array:
+    """Compute the error function.
+
+    Used by the exact (non-approximated) GELU. The array API has no ``erf``, so
+    each backend's own implementation is used; NumPy goes through SciPy, which
+    is already a core dependency.
+    """
+    if array_api_compat.is_jax_array(x):
+        from deepmd.jax.env import (
+            jax,
+        )
+
+        return jax.scipy.special.erf(x)
+    elif array_api_compat.is_torch_array(x):
+        import torch
+
+        return torch.special.erf(x)
+
+    xp = array_api_compat.array_namespace(x)
+    if getattr(xp, "__name__", "") == "deepmd._vendors.ndtensorflow":
+        import tensorflow as tf
+
+        # The NumPy round-trip below cannot serve TensorFlow. Under
+        # ``tf.function`` the conversion is refused outright, and in eager mode
+        # it detaches the erf factor from the tape, which leaves the exact GELU
+        # differentiating to Phi(x) alone -- silently, and for every backend
+        # user of ``gelu_erf`` rather than only Uni-Mol.
+        #
+        # Imported directly rather than through ``deepmd.tf2.env`` for symmetry
+        # with the JAX branch above: that module raises at import time unless
+        # eager execution is on, and this branch has to work inside
+        # ``tf.function``, where it is not.
+        return xp.asarray(tf.math.erf(x.unwrap()))
+
+    from scipy.special import (
+        erf,
+    )
+
+    if array_api_compat.is_numpy_array(x):
+        return erf(x)
+    # array-api-strict and friends: round-trip through NumPy.
+    return xp.asarray(erf(np.asarray(x)), dtype=x.dtype)
+
+
+def xp_setitem_at(x: Array, mask: Array, values: Array) -> Array:
+    """Set items at boolean mask indices.
+
+    For JAX and PyTorch arrays, returns a new array (non-mutating).
+    For NumPy arrays, modifies in-place and returns the same array.
+
+    Parameters
+    ----------
+    x : Array
+        The array to modify
+    mask : Array
+        Boolean mask indicating positions to set
+    values : Array
+        Values to set at masked positions
+
+    Returns
+    -------
+    Array
+        Modified array (new array for JAX/PyTorch, same array for NumPy)
+    """
+    if array_api_compat.is_jax_array(x):
+        # JAX doesn't support in-place item assignment
+        return x.at[mask].set(values)
+    elif array_api_compat.is_torch_array(x):
+        # PyTorch: clone to avoid mutating the input (non-mutating version)
+        import torch
+
+        result = torch.clone(x)
+        result[mask] = values
+        return result
+    # Standard item assignment for NumPy, array-api-strict, etc.
+    x[mask] = values
+    return x
+
+
+def xp_uniform(like: Array, size: int, low: float = 0.0, high: float = 1.0) -> Array:
+    """Draw ``size`` uniform samples in ``[low, high)`` on ``like``'s device.
+
+    Each backend uses its own generator: TensorFlow draws with
+    ``tf.random.uniform`` so traced graphs advance the runtime RNG, torch draws
+    with ``torch.rand`` (so ``setup_seed`` replays it without a host copy), and
+    other backends use :mod:`deepmd.utils.random`. Draws are therefore not
+    comparable across backends -- use only for a per-forward random stream,
+    never where a parity test looks.
+
+    Parameters
+    ----------
+    like : Array
+        Reference array supplying backend, dtype and device.
+    size : int
+        Number of samples to draw.
+    low : float
+        Lower bound of the interval.
+    high : float
+        Upper bound of the interval, exclusive.
+
+    Returns
+    -------
+    Array
+        Samples of shape ``(size,)`` matching ``like``.
+    """
+    xp = array_api_compat.array_namespace(like)
+    if getattr(xp, "__name__", "") == "deepmd._vendors.ndtensorflow":
+        import tensorflow as tf
+
+        sample_shape = tf.reshape(tf.cast(size, tf.int32), (1,))
+        samples = tf.random.uniform(
+            sample_shape,
+            minval=low,
+            maxval=high,
+            dtype=like.dtype,
+        )
+        return xp.asarray(samples)
+    if array_api_compat.is_torch_array(like):
+        import torch
+
+        return (
+            torch.rand(size, dtype=like.dtype, device=like.device) * (high - low) + low
+        )
+    from deepmd.utils import random as dp_random
+
+    drawn = np.asarray(dp_random.random(size)) * (high - low) + low
+    return xp.astype(
+        xp_asarray_nodetach(xp, drawn, device=array_api_compat.device(like)),
+        like.dtype,
+    )
+
+
+def xp_bincount(x: Array, weights: Array | None = None, minlength: int = 0) -> Array:
+    """Counts the number of occurrences of each value in x."""
+    xp = array_api_compat.array_namespace(x)
+    if (
+        array_api_compat.is_numpy_array(x)
+        or array_api_compat.is_jax_array(x)
+        or array_api_compat.is_torch_array(x)
+    ):
+        result = xp.bincount(x, weights=weights, minlength=minlength)
+    else:
+        if weights is None:
+            weights = xp.ones_like(x)
+        result = xp.zeros(
+            (max(minlength, int(xp.max(x)) + 1),),
+            dtype=weights.dtype,
+            device=array_api_compat.device(weights),
+        )
+        result = xp_add_at(result, x, weights)
+    return result

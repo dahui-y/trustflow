@@ -1,0 +1,1434 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
+"""Tests for loading pt_expt training checkpoints (`.pt`) for inference.
+
+Covers two pieces:
+
+1. ``Backend.detect_backend_by_model`` sniffs ``.pt`` content
+   (``.w`` weights -> pt_expt and ``.matrix`` weights -> pt, with only the
+   pt_expt-specific ``.b`` suffix used as a fallback) so that
+   ``dp test -m foo.pt`` routes to the right backend.
+2. ``pt_expt.DeepEval._load_pt`` reconstructs the model from
+   ``_extra_state["model_params"]``, loads ``state_dict``, and runs
+   inference in eager mode, producing outputs that match a direct
+   forward of the source model.
+"""
+
+import copy
+import os
+import shutil
+import tempfile
+import unittest
+from unittest import (
+    mock,
+)
+
+import numpy as np
+import pytest
+import torch
+
+from deepmd.backend.backend import (
+    Backend,
+)
+from deepmd.dpmodel.output_def import (
+    ModelOutputDef,
+)
+from deepmd.infer import (
+    DeepPot,
+)
+from deepmd.pt_expt.descriptor.se_e2_a import (
+    DescrptSeA,
+)
+from deepmd.pt_expt.fitting import (
+    EnergyFittingNet,
+)
+from deepmd.pt_expt.infer.deep_eval import DeepEval as PtExptDeepEval
+from deepmd.pt_expt.model import (
+    EnergyModel,
+    get_model,
+)
+from deepmd.pt_expt.model.graph_lower import (
+    model_uses_graph_lower,
+)
+from deepmd.pt_expt.train.wrapper import (
+    ModelWrapper,
+)
+from deepmd.pt_expt.utils.env import (
+    DEVICE,
+)
+from deepmd.utils.pt_checkpoint import (
+    detect_pt_checkpoint_backend,
+)
+
+from ...seed import (
+    GLOBAL_SEED,
+)
+
+
+def _build_model_and_params(
+    rcut: float = 4.0, seed: int = GLOBAL_SEED
+) -> tuple[EnergyModel, dict]:
+    """Build a small pt_expt EnergyModel and the matching ``model_params`` dict.
+
+    The ``seed`` parameter lets callers build distinguishable models when
+    they need head-selection tests to produce different outputs per head.
+    """
+    type_map = ["foo", "bar"]
+    sel = [8, 6]
+    descriptor_args = {
+        "type": "se_e2_a",
+        "rcut": rcut,
+        "rcut_smth": 0.5,
+        "sel": sel,
+        "neuron": [4, 8],
+        "axis_neuron": 4,
+        "type_one_side": True,
+        "seed": seed,
+    }
+    fitting_args = {
+        "type": "ener",
+        "neuron": [8, 8],
+        "resnet_dt": True,
+        "seed": seed,
+    }
+
+    ds = DescrptSeA(
+        rcut=rcut,
+        rcut_smth=0.5,
+        sel=sel,
+        neuron=[4, 8],
+        axis_neuron=4,
+        type_one_side=True,
+        seed=seed,
+    )
+    ft = EnergyFittingNet(
+        len(type_map),
+        ds.get_dim_out(),
+        neuron=[8, 8],
+        resnet_dt=True,
+        mixed_types=ds.mixed_types(),
+        seed=seed,
+    )
+    # Move to DEVICE so tests that build eager-reference tensors at
+    # `device=DEVICE` and call `model.forward(...)` don't device-mismatch
+    # on CUDA/MPS runners.
+    model = EnergyModel(ds, ft, type_map=type_map).to(torch.float64).to(DEVICE).eval()
+
+    model_params = {
+        "type_map": type_map,
+        "descriptor": descriptor_args,
+        "fitting_net": fitting_args,
+    }
+    return model, model_params
+
+
+def _build_graph_dpa1_model_and_params() -> tuple[EnergyModel, dict]:
+    """Build a graph-routed DPA1 model with nonzero descriptor statistics."""
+    model_params = {
+        "type_map": ["H", "O"],
+        "descriptor": {
+            "type": "dpa1",
+            "sel": 20,
+            "rcut_smth": 0.5,
+            "rcut": 4.0,
+            "neuron": [3, 6],
+            "axis_neuron": 2,
+            "attn": 4,
+            "attn_layer": 0,
+            "smooth_type_embedding": True,
+            "set_davg_zero": False,
+            "type_one_side": True,
+            "precision": "float64",
+            "seed": 1,
+        },
+        "fitting_net": {
+            "type": "ener",
+            "neuron": [8, 8],
+            "precision": "float64",
+            "seed": 1,
+        },
+    }
+    model = get_model(copy.deepcopy(model_params)).to(torch.float64).to(DEVICE).eval()
+    with torch.no_grad():
+        model.atomic_model.descriptor.se_atten.mean.fill_(0.01)
+        model.atomic_model.descriptor.se_atten.stddev.fill_(0.1)
+    return model, model_params
+
+
+def _save_pt_checkpoint(
+    model: EnergyModel,
+    model_params: dict,
+    path: str,
+) -> None:
+    """Save a checkpoint in the layout produced by pt_expt training."""
+    wrapper = ModelWrapper(model, model_params=model_params)
+    state = {"model": wrapper.state_dict()}
+    torch.save(state, path)
+
+
+def _save_pt_checkpoint_compiled(
+    model: EnergyModel,
+    model_params: dict,
+    path: str,
+) -> None:
+    """Save a checkpoint with the `_CompiledModel`-wrapped layout.
+
+    Mirrors what ``deepmd.pt_expt.train.training`` writes after compilation
+    (training.py:996): each head's model is wrapped in ``_CompiledModel``,
+    so state-dict keys gain an ``original_model.`` infix and pick up extra
+    ``compiled_forward_lower._orig_mod._param_constant*`` / ``_tensor_constant*``
+    entries (graph constants baked into the compiled ``forward_lower``).
+
+    We synthesise that layout directly so the test does not pay the cost of
+    a real ``torch.compile`` invocation.
+    """
+    base_wrapper = ModelWrapper(model, model_params=model_params)
+    base_state = base_wrapper.state_dict()
+    cooked: dict = {}
+    for key, value in base_state.items():
+        if key == "_extra_state":
+            cooked[key] = value
+            continue
+        # `model.Default.X` -> `model.Default.original_model.X`
+        cooked[key.replace("model.Default.", "model.Default.original_model.", 1)] = (
+            value
+        )
+    # Add a few graph-artifact keys with arbitrary tensors. These must be
+    # silently dropped by the loader; if they leak through they will appear
+    # as unexpected-keys in strict load_state_dict.
+    for i in range(3):
+        cooked[f"model.Default.compiled_forward_lower._orig_mod._param_constant{i}"] = (
+            torch.zeros(1)
+        )
+    for i in range(2):
+        cooked[
+            f"model.Default.compiled_forward_lower._orig_mod._tensor_constant{i}"
+        ] = torch.zeros(1)
+    torch.save({"model": cooked}, path)
+
+
+class TestPtCheckpointBackendDetection(unittest.TestCase):
+    """Checkpoint dialect detection must be conservative and deterministic."""
+
+    def test_parameter_name_matrix(self) -> None:
+        cases = {
+            "wrapped pt_expt weight with torch bias": (
+                {"model": {"layer.w": object(), "module.bias": object()}},
+                "pt-expt",
+            ),
+            "unwrapped pt weight": ({"layer.matrix": object()}, "pt"),
+            "pt_expt bias only": ({"layer.b": object()}, "pt-expt"),
+            "torch bias only": ({"layer.bias": object()}, None),
+            "mixed weights": (
+                {"left.w": object(), "right.matrix": object()},
+                None,
+            ),
+            "mixed biases": (
+                {"left.b": object(), "right.bias": object()},
+                None,
+            ),
+            "no string keys": ({1: object()}, None),
+            "non-mapping payload": (object(), None),
+            "wrapped non-mapping payload": ({"model": object()}, None),
+        }
+        for name, (checkpoint, expected) in cases.items():
+            with self.subTest(name=name):
+                self.assertEqual(
+                    detect_pt_checkpoint_backend(checkpoint),
+                    expected,
+                )
+
+
+class TestBackendDispatchPt(unittest.TestCase):
+    """``Backend.detect_backend_by_model`` must sniff `.pt` content."""
+
+    def setUp(self) -> None:
+        # Real pt_expt-trained checkpoint (uses `.w`/`.b` keys).
+        model, model_params = _build_model_and_params()
+        self.output_def = ModelOutputDef(model.atomic_output_def())
+        self.pt_expt_pt = tempfile.NamedTemporaryFile(suffix=".pt", delete=False).name
+        _save_pt_checkpoint(model, model_params, self.pt_expt_pt)
+
+        # Synthetic pt-style state dict (uses `.matrix`/`.bias` keys).
+        # We do not need to build a real pt model — only the keys matter
+        # for backend dispatch.
+        self.pt_pt = tempfile.NamedTemporaryFile(suffix=".pt", delete=False).name
+        torch.save(
+            {
+                "model": {
+                    "model.Default.atomic_model.descriptor.dummy.matrix": (
+                        torch.zeros(1)
+                    ),
+                    "model.Default.atomic_model.fitting_net.dummy.bias": (
+                        torch.zeros(1)
+                    ),
+                }
+            },
+            self.pt_pt,
+        )
+
+        # Mixed weight dialects are deliberately unclassified.
+        self.ambiguous_pt = tempfile.NamedTemporaryFile(suffix=".pt", delete=False).name
+        torch.save(
+            {
+                "model": {
+                    "left.w": torch.zeros(1),
+                    "right.matrix": torch.zeros(1),
+                }
+            },
+            self.ambiguous_pt,
+        )
+
+        # File that exists but is not a valid torch checkpoint — sniffing
+        # must fail gracefully and fall back to suffix dispatch.
+        self.bogus_pt = tempfile.NamedTemporaryFile(suffix=".pt", delete=False).name
+        with open(self.bogus_pt, "wb") as f:
+            f.write(b"not a real torch file")
+
+    def tearDown(self) -> None:
+        for p in (
+            self.pt_expt_pt,
+            self.pt_pt,
+            self.ambiguous_pt,
+            self.bogus_pt,
+        ):
+            if os.path.exists(p):
+                os.unlink(p)
+
+    def test_pt_expt_checkpoint_routes_to_pt_expt(self) -> None:
+        backend = Backend.detect_backend_by_model(self.pt_expt_pt)
+        self.assertIs(backend, Backend.get_backend("pt-expt"))
+
+    def test_pt_checkpoint_routes_to_pt(self) -> None:
+        backend = Backend.detect_backend_by_model(self.pt_pt)
+        self.assertIs(backend, Backend.get_backend("pt"))
+
+    def test_bogus_pt_falls_back_to_suffix(self) -> None:
+        # Sniffing fails (not a real torch archive) → suffix dispatch
+        # picks the pt backend (registered owner of `.pt`).
+        backend = Backend.detect_backend_by_model(self.bogus_pt)
+        self.assertIs(backend, Backend.get_backend("pt"))
+
+    def test_forced_pt_expt_rejects_other_dialects(self) -> None:
+        cases = (
+            (self.pt_pt, "regular `pt` parameter dialect"),
+            (self.ambiguous_pt, "Cannot determine the parameter dialect"),
+        )
+        for checkpoint, message in cases:
+            with self.subTest(checkpoint=checkpoint):
+                with self.assertRaisesRegex(ValueError, message):
+                    PtExptDeepEval(checkpoint, self.output_def)
+
+
+class TestPtExptLoadPt(unittest.TestCase):
+    """``pt_expt.DeepEval._load_pt`` produces outputs matching the source model."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.model, cls.model_params = _build_model_and_params()
+        cls.pt_path = tempfile.NamedTemporaryFile(suffix=".pt", delete=False).name
+        _save_pt_checkpoint(cls.model, cls.model_params, cls.pt_path)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        if os.path.exists(cls.pt_path):
+            os.unlink(cls.pt_path)
+
+    def test_metadata_accessors(self) -> None:
+        de = PtExptDeepEval(
+            self.pt_path,
+            ModelOutputDef(self.model.atomic_output_def()),
+        )
+        self.assertAlmostEqual(de.get_rcut(), self.model.get_rcut())
+        self.assertEqual(de.get_type_map(), self.model.get_type_map())
+        self.assertEqual(de.get_ntypes(), len(self.model.get_type_map()))
+        self.assertEqual(de.get_dim_fparam(), 0)
+        self.assertEqual(de.get_dim_aparam(), 0)
+        self.assertFalse(de._is_spin)
+
+    def test_nlist_controls_remain_available(self) -> None:
+        output_def = ModelOutputDef(self.model.atomic_output_def())
+        PtExptDeepEval(
+            self.pt_path,
+            output_def,
+            neighbor_list=mock.sentinel.neighbor_list,
+        )
+        PtExptDeepEval(
+            self.pt_path,
+            output_def,
+            nlist_backend="native",
+        )
+        with self.assertRaisesRegex(ValueError, "only applies to graph-routed"):
+            PtExptDeepEval(
+                self.pt_path,
+                output_def,
+                neighbor_graph_method="dense",
+            )
+
+    def test_eval_matches_source_model(self) -> None:
+        """Run inference via DeepPot(.pt) and compare to direct forward."""
+        dp = DeepPot(self.pt_path)
+
+        rng = np.random.default_rng(GLOBAL_SEED)
+        natoms = 5
+        nt = len(self.model.get_type_map())
+        coords = rng.random((1, natoms, 3)) * 8.0
+        cells = np.eye(3).reshape(1, 9) * 10.0
+        atom_types = np.array([i % nt for i in range(natoms)], dtype=np.int32)
+
+        e, f, v, ae, av = dp.eval(coords, cells, atom_types, atomic=True)
+
+        coord_t = torch.tensor(
+            coords, dtype=torch.float64, device=DEVICE
+        ).requires_grad_(True)
+        atype_t = torch.tensor(
+            atom_types.reshape(1, -1), dtype=torch.int64, device=DEVICE
+        )
+        cell_t = torch.tensor(cells, dtype=torch.float64, device=DEVICE)
+        ref = self.model.forward(coord_t, atype_t, cell_t, do_atomic_virial=True)
+
+        np.testing.assert_allclose(
+            e, ref["energy"].detach().cpu().numpy(), rtol=1e-10, atol=1e-10
+        )
+        np.testing.assert_allclose(
+            f, ref["force"].detach().cpu().numpy(), rtol=1e-10, atol=1e-10
+        )
+        np.testing.assert_allclose(
+            v, ref["virial"].detach().cpu().numpy(), rtol=1e-10, atol=1e-10
+        )
+        np.testing.assert_allclose(
+            ae,
+            ref["atom_energy"].detach().cpu().numpy(),
+            rtol=1e-10,
+            atol=1e-10,
+        )
+        np.testing.assert_allclose(
+            av,
+            ref["atom_virial"].detach().cpu().numpy(),
+            rtol=1e-10,
+            atol=1e-10,
+        )
+
+    def test_unsupported_extension_raises(self) -> None:
+        """`.pth` and other unknown suffixes hit pt_expt's explicit error."""
+        bogus = tempfile.NamedTemporaryFile(suffix=".pth", delete=False).name
+        try:
+            torch.save({"model": {}}, bogus)
+            with self.assertRaisesRegex(ValueError, "Unsupported model file"):
+                PtExptDeepEval(bogus, ModelOutputDef(self.model.atomic_output_def()))
+        finally:
+            os.unlink(bogus)
+
+
+class TestNeighborGraphMethodResolution(unittest.TestCase):
+    """Auto graph-builder selection must cover each host policy explicitly."""
+
+    def test_explicit_resolution(self) -> None:
+        """Every implemented graph builder is accepted without rewriting."""
+        for method in ("dense", "ase", "cell", "vesin", "nv"):
+            with self.subTest(method=method):
+                self.assertEqual(
+                    PtExptDeepEval._resolve_neighbor_graph_method(method),
+                    method,
+                )
+
+    def test_auto_deferred_until_nf_known(self) -> None:
+        """Construction-time resolve leaves ``auto`` unresolved without ``nf``."""
+        self.assertEqual(
+            PtExptDeepEval._resolve_neighbor_graph_method("auto"),
+            "auto",
+        )
+
+    def test_auto_resolution(self) -> None:
+        # (device, nv, cell, vesin, nf, expected, warns)
+        #
+        # ``cell`` is the native threaded CPU search; it takes precedence over
+        # ``vesin`` on a CPU host at any frame count, because it batches no
+        # worse and its search is an order of magnitude faster.
+        cases = (
+            ("cpu", False, True, True, 1, "cell", False),
+            ("cpu", False, True, True, 4, "cell", False),
+            ("cpu", False, False, True, 1, "vesin", False),
+            ("cpu", False, False, True, 4, "dense", False),
+            ("cpu", False, False, False, 1, "dense", False),
+            ("cuda", True, True, True, 1, "nv", False),
+            ("cuda", True, True, True, 4, "nv", False),
+            ("cuda", False, True, True, 1, "vesin", False),
+            ("cuda", False, True, True, 4, "dense", True),
+            ("cuda", False, True, False, 1, "dense", True),
+        )
+        for (
+            device_type,
+            nv_available,
+            cell_available,
+            vesin_available,
+            nf,
+            expected,
+            warns,
+        ) in cases:
+            with self.subTest(
+                device_type=device_type,
+                nv_available=nv_available,
+                cell_available=cell_available,
+                vesin_available=vesin_available,
+                nf=nf,
+            ):
+                with (
+                    mock.patch(
+                        "deepmd.pt_expt.utils.env.DEVICE",
+                        torch.device(device_type),
+                    ),
+                    mock.patch(
+                        "deepmd.pt.utils.nv_nlist.is_nv_available",
+                        return_value=nv_available,
+                    ),
+                    mock.patch(
+                        "deepmd.pt_expt.utils.cell_graph_builder.is_cell_search_available",
+                        return_value=cell_available,
+                    ),
+                    mock.patch(
+                        "deepmd.pt_expt.utils.vesin_neighbor_list.is_vesin_torch_available",
+                        return_value=vesin_available,
+                    ),
+                ):
+                    if warns:
+                        # reset warn-once so each case can assert the message
+                        import deepmd.pt_expt.utils.graph_builder as gb
+
+                        gb._warned_auto_no_nv = False
+                        with self.assertLogs(
+                            "deepmd.pt_expt.utils.graph_builder",
+                            level="WARNING",
+                        ):
+                            actual = PtExptDeepEval._resolve_neighbor_graph_method(
+                                "auto", nf=nf
+                            )
+                    else:
+                        actual = PtExptDeepEval._resolve_neighbor_graph_method(
+                            "auto", nf=nf
+                        )
+                self.assertEqual(actual, expected)
+
+
+class TestCellGraphDeviceRouting(unittest.TestCase):
+    """The CPU-only cell search must not receive CUDA tensors."""
+
+    @staticmethod
+    def _make_evaluator() -> PtExptDeepEval:
+        evaluator = object.__new__(PtExptDeepEval)
+        evaluator._neighbor_graph_method = "cell"
+        evaluator._rcut = 3.0
+        evaluator.metadata = {"graph_edge_dtype": "float32"}
+        return evaluator
+
+    def test_fused_cell_builder_uses_cpu(self) -> None:
+        """The single-frame fused cell builder receives CPU inputs."""
+        evaluator = self._make_evaluator()
+        expected = mock.sentinel.graph
+        with (
+            mock.patch.object(evaluator, "_model_pair_excl", return_value=None),
+            mock.patch(
+                "deepmd.pt_expt.utils.cell_graph_builder.build_neighbor_graph_fused",
+                return_value=expected,
+            ) as builder,
+        ):
+            actual = evaluator._build_eval_graph(
+                np.zeros((1, 6)),
+                np.zeros((1, 2), dtype=np.int64),
+                np.eye(3).reshape(1, 9),
+                torch.device("cuda"),
+            )
+
+        self.assertIs(actual, expected)
+        for value in builder.call_args.args[:3]:
+            self.assertEqual(value.device.type, "cpu")
+
+    def test_general_cell_builder_uses_cpu(self) -> None:
+        """The batched cell builder receives CPU inputs."""
+        evaluator = self._make_evaluator()
+        expected = mock.sentinel.graph
+        with (
+            mock.patch.object(evaluator, "_model_pair_excl", return_value=None),
+            mock.patch(
+                "deepmd.pt_expt.utils.cell_graph_builder.build_neighbor_graph_cell",
+                return_value=expected,
+            ) as builder,
+        ):
+            actual = evaluator._build_eval_graph(
+                np.zeros((2, 6)),
+                np.zeros((2, 2), dtype=np.int64),
+                np.tile(np.eye(3).reshape(1, 9), (2, 1)),
+                torch.device("cuda"),
+            )
+
+        self.assertIs(actual, expected)
+        for value in builder.call_args.args[:3]:
+            self.assertEqual(value.device.type, "cpu")
+
+
+class TestPtExptLoadPtGraphDPA1(unittest.TestCase):
+    """Raw DPA1 checkpoints retain the source model's graph-forward semantics."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.model, cls.model_params = _build_graph_dpa1_model_and_params()
+        cls.pt_paths = {
+            "plain": tempfile.NamedTemporaryFile(suffix=".pt", delete=False).name,
+            "compiled": tempfile.NamedTemporaryFile(suffix=".pt", delete=False).name,
+        }
+        _save_pt_checkpoint(cls.model, cls.model_params, cls.pt_paths["plain"])
+        _save_pt_checkpoint_compiled(
+            cls.model,
+            cls.model_params,
+            cls.pt_paths["compiled"],
+        )
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        for path in cls.pt_paths.values():
+            if os.path.exists(path):
+                os.unlink(path)
+
+    def test_eval_matches_public_forward(self) -> None:
+        self.assertTrue(model_uses_graph_lower(self.model))
+
+        coords = np.array([[[1.0, 1.0, 1.0], [2.0, 1.0, 1.0], [1.0, 2.0, 1.0]]])
+        cells = np.eye(3).reshape(1, 9) * 10.0
+        atom_types = np.array([0, 1, 0], dtype=np.int32)
+
+        output_names = (
+            "energy",
+            "force",
+            "virial",
+            "atom_energy",
+            "atom_virial",
+        )
+        coord_t = torch.tensor(
+            coords, dtype=torch.float64, device=DEVICE
+        ).requires_grad_(True)
+        atype_t = torch.tensor(
+            atom_types.reshape(1, -1), dtype=torch.int64, device=DEVICE
+        )
+        cell_t = torch.tensor(cells, dtype=torch.float64, device=DEVICE)
+        expected = self.model.forward(
+            coord_t,
+            atype_t,
+            cell_t,
+            do_atomic_virial=True,
+        )
+
+        for layout, path in self.pt_paths.items():
+            with self.subTest(layout=layout):
+                dp = DeepPot(path, auto_batch_size=False)
+                self.assertEqual(dp.deep_eval.metadata["lower_input_kind"], "graph")
+                actual = dict(
+                    zip(
+                        output_names,
+                        dp.eval(coords, cells, atom_types, atomic=True),
+                        strict=True,
+                    )
+                )
+                for name in output_names:
+                    np.testing.assert_allclose(
+                        actual[name],
+                        expected[name].detach().cpu().numpy(),
+                        rtol=1e-10,
+                        atol=1e-10,
+                        err_msg=name,
+                    )
+
+    def test_nlist_controls_fail_without_changing_graph_semantics(self) -> None:
+        output_def = ModelOutputDef(self.model.atomic_output_def())
+        path = self.pt_paths["plain"]
+        with self.assertRaisesRegex(
+            ValueError,
+            "switching to the nlist lower would change",
+        ):
+            PtExptDeepEval(
+                path,
+                output_def,
+                neighbor_list=mock.sentinel.neighbor_list,
+            )
+        with self.assertRaisesRegex(
+            ValueError,
+            "only applies to nlist-routed artifacts",
+        ):
+            PtExptDeepEval(
+                path,
+                output_def,
+                nlist_backend="native",
+            )
+
+
+class TestPtExptLoadPtCompiledLayout(unittest.TestCase):
+    """`.pt` saved after pt_expt training compilation (`_CompiledModel` wrap).
+
+    Real training-produced checkpoints have ``model.Default.original_model.X``
+    for the trained weights plus ``model.Default.compiled_forward_lower.*``
+    for the compiled-graph constants.  ``_load_pt`` must strip the
+    ``original_model.`` infix and drop the ``compiled_forward_lower.*`` keys
+    so eager inference works on the recovered weights.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.model, cls.model_params = _build_model_and_params()
+        cls.pt_path = tempfile.NamedTemporaryFile(suffix=".pt", delete=False).name
+        _save_pt_checkpoint_compiled(cls.model, cls.model_params, cls.pt_path)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        if os.path.exists(cls.pt_path):
+            os.unlink(cls.pt_path)
+
+    def test_eval_matches_source_model(self) -> None:
+        """Eval through the compiled-layout `.pt` matches direct forward."""
+        dp = DeepPot(self.pt_path)
+
+        rng = np.random.default_rng(GLOBAL_SEED)
+        natoms = 5
+        nt = len(self.model.get_type_map())
+        coords = rng.random((1, natoms, 3)) * 8.0
+        cells = np.eye(3).reshape(1, 9) * 10.0
+        atom_types = np.array([i % nt for i in range(natoms)], dtype=np.int32)
+
+        e, f, v, ae, av = dp.eval(coords, cells, atom_types, atomic=True)
+
+        coord_t = torch.tensor(
+            coords, dtype=torch.float64, device=DEVICE
+        ).requires_grad_(True)
+        atype_t = torch.tensor(
+            atom_types.reshape(1, -1), dtype=torch.int64, device=DEVICE
+        )
+        cell_t = torch.tensor(cells, dtype=torch.float64, device=DEVICE)
+        ref = self.model.forward(coord_t, atype_t, cell_t, do_atomic_virial=True)
+
+        np.testing.assert_allclose(
+            e, ref["energy"].detach().cpu().numpy(), rtol=1e-10, atol=1e-10
+        )
+        np.testing.assert_allclose(
+            f, ref["force"].detach().cpu().numpy(), rtol=1e-10, atol=1e-10
+        )
+        np.testing.assert_allclose(
+            v, ref["virial"].detach().cpu().numpy(), rtol=1e-10, atol=1e-10
+        )
+        np.testing.assert_allclose(
+            ae, ref["atom_energy"].detach().cpu().numpy(), rtol=1e-10, atol=1e-10
+        )
+        np.testing.assert_allclose(
+            av, ref["atom_virial"].detach().cpu().numpy(), rtol=1e-10, atol=1e-10
+        )
+
+
+def _save_multitask_checkpoint(
+    models: dict,
+    model_params: dict,
+    path: str,
+    *,
+    compiled: bool = False,
+) -> None:
+    """Save a multi-task `.pt` checkpoint, optionally with the compiled wrap."""
+    wrapper = ModelWrapper(models, model_params=model_params)
+    state = wrapper.state_dict()
+    if not compiled:
+        torch.save({"model": state}, path)
+        return
+    cooked: dict = {}
+    for key, value in state.items():
+        if key == "_extra_state":
+            cooked[key] = value
+            continue
+        # `model.{head}.X` -> `model.{head}.original_model.X`
+        # Locate the head segment as the first token after the leading "model."
+        # (head names cannot contain dots in deepmd-kit, so this is unambiguous).
+        parts = key.split(".", 2)  # ["model", head, "rest..."]
+        if len(parts) == 3 and parts[0] == "model":
+            new_key = f"model.{parts[1]}.original_model.{parts[2]}"
+        else:
+            new_key = key
+        cooked[new_key] = value
+    # Add a few graph artifacts per head — they must be silently dropped.
+    for head in models:
+        for i in range(2):
+            cooked[
+                f"model.{head}.compiled_forward_lower._orig_mod._param_constant{i}"
+            ] = torch.zeros(1)
+    torch.save({"model": cooked}, path)
+
+
+class TestPtExptLoadPtMultiTask(unittest.TestCase):
+    """Multi-task `.pt` checkpoints: head selection (plain + compiled wrap)."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        # Build two single-task models with the same architecture but
+        # different seeds. Distinct seeds matter so that a head-routing
+        # bug (loading head_b's weights when head_a is requested, or
+        # vice versa) actually shows up as an assertion failure.
+        cls.model_a, params_a = _build_model_and_params(rcut=4.0, seed=42)
+        cls.model_b, params_b = _build_model_and_params(rcut=4.0, seed=7)
+        cls.models = {"head_a": cls.model_a, "head_b": cls.model_b}
+        cls.model_params = {"model_dict": {"head_a": params_a, "head_b": params_b}}
+
+        cls.pt_path = tempfile.NamedTemporaryFile(suffix=".pt", delete=False).name
+        _save_multitask_checkpoint(
+            cls.models, cls.model_params, cls.pt_path, compiled=False
+        )
+
+        cls.pt_path_compiled = tempfile.NamedTemporaryFile(
+            suffix=".pt", delete=False
+        ).name
+        _save_multitask_checkpoint(
+            cls.models, cls.model_params, cls.pt_path_compiled, compiled=True
+        )
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        for p in (cls.pt_path, cls.pt_path_compiled):
+            if os.path.exists(p):
+                os.unlink(p)
+
+    def test_select_head_matches_single_task_forward(self) -> None:
+        rng = np.random.default_rng(GLOBAL_SEED + 1)
+        natoms = 4
+        coords = rng.random((1, natoms, 3)) * 8.0
+        cells = np.eye(3).reshape(1, 9) * 10.0
+        atom_types = np.array([i % 2 for i in range(natoms)], dtype=np.int32)
+
+        for head, src in (("head_a", self.model_a), ("head_b", self.model_b)):
+            # Build a DeepPot wrapping this DeepEval for end-to-end eval.
+            dp = DeepPot(self.pt_path, head=head)
+            de = dp.deep_eval
+            e, f, _v = dp.eval(coords, cells, atom_types, atomic=False)
+
+            coord_t = torch.tensor(
+                coords, dtype=torch.float64, device=DEVICE
+            ).requires_grad_(True)
+            atype_t = torch.tensor(
+                atom_types.reshape(1, -1), dtype=torch.int64, device=DEVICE
+            )
+            cell_t = torch.tensor(cells, dtype=torch.float64, device=DEVICE)
+            ref = src.forward(coord_t, atype_t, cell_t, do_atomic_virial=False)
+
+            np.testing.assert_allclose(
+                e,
+                ref["energy"].detach().cpu().numpy(),
+                rtol=1e-10,
+                atol=1e-10,
+                err_msg=f"head={head}, energy",
+            )
+            np.testing.assert_allclose(
+                f,
+                ref["force"].detach().cpu().numpy(),
+                rtol=1e-10,
+                atol=1e-10,
+                err_msg=f"head={head}, force",
+            )
+            self.assertEqual(de.get_type_map(), src.get_type_map())
+
+    def test_distinct_heads_produce_distinct_outputs(self) -> None:
+        """Sanity check that head_a and head_b really resolve to different weights."""
+        rng = np.random.default_rng(GLOBAL_SEED + 2)
+        natoms = 4
+        coords = rng.random((1, natoms, 3)) * 8.0
+        cells = np.eye(3).reshape(1, 9) * 10.0
+        atom_types = np.array([i % 2 for i in range(natoms)], dtype=np.int32)
+        e_a = DeepPot(self.pt_path, head="head_a").eval(
+            coords, cells, atom_types, atomic=False
+        )[0]
+        e_b = DeepPot(self.pt_path, head="head_b").eval(
+            coords, cells, atom_types, atomic=False
+        )[0]
+        self.assertFalse(
+            np.allclose(e_a, e_b),
+            "head_a and head_b produced identical outputs — head selection "
+            "may be loading the wrong weights",
+        )
+
+    def test_missing_head_raises(self) -> None:
+        with self.assertRaisesRegex(ValueError, "Head 'no_such_head' not found"):
+            DeepPot(self.pt_path, head="no_such_head")
+
+    def test_no_head_when_no_default_raises(self) -> None:
+        # Neither head is named "Default", so omitting --head must raise.
+        with self.assertRaisesRegex(ValueError, "pass --head to select one"):
+            DeepPot(self.pt_path)
+
+    def test_select_head_compiled_layout_matches(self) -> None:
+        """Compiled-wrap multi-task `.pt`: each head's eval matches eager."""
+        rng = np.random.default_rng(GLOBAL_SEED + 11)
+        natoms = 4
+        coords = rng.random((1, natoms, 3)) * 8.0
+        cells = np.eye(3).reshape(1, 9) * 10.0
+        atom_types = np.array([i % 2 for i in range(natoms)], dtype=np.int32)
+
+        for head, src in (("head_a", self.model_a), ("head_b", self.model_b)):
+            dp = DeepPot(self.pt_path_compiled, head=head)
+            e, f, _v = dp.eval(coords, cells, atom_types, atomic=False)
+
+            coord_t = torch.tensor(
+                coords, dtype=torch.float64, device=DEVICE
+            ).requires_grad_(True)
+            atype_t = torch.tensor(
+                atom_types.reshape(1, -1), dtype=torch.int64, device=DEVICE
+            )
+            cell_t = torch.tensor(cells, dtype=torch.float64, device=DEVICE)
+            ref = src.forward(coord_t, atype_t, cell_t, do_atomic_virial=False)
+
+            np.testing.assert_allclose(
+                e,
+                ref["energy"].detach().cpu().numpy(),
+                rtol=1e-10,
+                atol=1e-10,
+                err_msg=f"compiled layout, head={head}, energy",
+            )
+            np.testing.assert_allclose(
+                f,
+                ref["force"].detach().cpu().numpy(),
+                rtol=1e-10,
+                atol=1e-10,
+                err_msg=f"compiled layout, head={head}, force",
+            )
+
+
+def _make_spin_files(spin_config: dict) -> dict:
+    """Build a single pt_expt SpinEnergyModel and serialise it to .pt + .pte.
+
+    Returns a dict with keys ``model``, ``.pt``, ``.pte``, ``tmpdir``.  Both
+    files reconstruct the *same* underlying model so cross-format consistency
+    tests are byte-comparable.
+    """
+    from deepmd.pt_expt.model import get_model as pt_expt_get_model
+    from deepmd.pt_expt.utils.serialization import (
+        deserialize_to_file,
+    )
+
+    model = pt_expt_get_model(copy.deepcopy(spin_config))
+    model = model.to(torch.float64).to(DEVICE)
+    model.eval()
+
+    tmpdir = tempfile.mkdtemp()
+    pt_path = os.path.join(tmpdir, "spin.pt")
+    pte_path = os.path.join(tmpdir, "spin.pte")
+
+    # `.pt` checkpoint via ModelWrapper.
+    wrapper = ModelWrapper(model, model_params=copy.deepcopy(spin_config))
+    torch.save({"model": wrapper.state_dict()}, pt_path)
+
+    # `.pte` archive via the standard serialize -> deserialize_to_file path.
+    # Use the *same* model instance's serialize() so weights match bit-for-bit.
+    data = {
+        "model": model.serialize(),
+        "model_def_script": copy.deepcopy(spin_config),
+        "backend": "pt_expt",
+        "software": "deepmd-kit",
+        "version": "3.0.0",
+    }
+    prev = torch.get_default_device()
+    torch.set_default_device(None)
+    try:
+        deserialize_to_file(pte_path, data)
+    finally:
+        torch.set_default_device(prev)
+
+    return {"model": model, ".pt": pt_path, ".pte": pte_path, "tmpdir": tmpdir}
+
+
+def _spin_eager_reference(model, COORD, ATYPE, SPIN, BOX):
+    """Run the source model in eager mode and return numpy outputs."""
+    natoms = len(ATYPE)
+    coord_t = torch.tensor(
+        COORD.reshape(1, natoms, 3), dtype=torch.float64, device=DEVICE
+    ).requires_grad_(True)
+    atype_t = torch.tensor([ATYPE], dtype=torch.int64, device=DEVICE)
+    spin_t = torch.tensor(
+        SPIN.reshape(1, natoms, 3), dtype=torch.float64, device=DEVICE
+    )
+    box_t = torch.tensor(BOX.reshape(1, 9), dtype=torch.float64, device=DEVICE)
+    ref = model(coord_t, atype_t, spin_t, box_t)
+    return {k: v.detach().cpu().numpy() for k, v in ref.items()}
+
+
+class TestPtExptLoadPtNativeSpinDPA4(unittest.TestCase):
+    """A native-spin DPA4 checkpoint reaches the graph-spin eager runner."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        from ..model.test_dpa4_native_spin import (
+            NATIVE_SPIN_CONFIG,
+            _build_native_spin_model_cpu,
+        )
+        from .test_deep_eval_spin import (
+            ATYPE,
+            BOX,
+            COORD,
+            SPIN,
+        )
+
+        cls.ATYPE = ATYPE
+        cls.BOX = BOX
+        cls.COORD = COORD
+        cls.SPIN = SPIN
+        cls.model = _build_native_spin_model_cpu().to(DEVICE).eval()
+        cls.ref = _spin_eager_reference(
+            cls.model, cls.COORD, cls.ATYPE, cls.SPIN, cls.BOX
+        )
+        cls.pt_path = tempfile.NamedTemporaryFile(suffix=".pt", delete=False).name
+        _save_pt_checkpoint(
+            cls.model,
+            copy.deepcopy(NATIVE_SPIN_CONFIG),
+            cls.pt_path,
+        )
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        if os.path.exists(cls.pt_path):
+            os.unlink(cls.pt_path)
+
+    def test_auto_dispatch_and_eval_match_eager(self) -> None:
+        backend = Backend.detect_backend_by_model(self.pt_path)
+        self.assertIs(backend, Backend.get_backend("pt-expt"))
+
+        dp = DeepPot(
+            self.pt_path,
+            auto_batch_size=False,
+            neighbor_graph_method="dense",
+        )
+        self.assertTrue(dp.has_spin)
+        self.assertEqual(dp.deep_eval.metadata["lower_input_kind"], "graph")
+        self.assertEqual(dp.deep_eval._neighbor_graph_method, "dense")
+
+        energy, force, virial, force_mag, mask_mag = dp.eval(
+            self.COORD,
+            self.BOX,
+            self.ATYPE,
+            atomic=False,
+            spin=self.SPIN,
+        )
+        for name, actual in (
+            ("energy", energy),
+            ("force", force),
+            ("virial", virial),
+            ("force_mag", force_mag),
+        ):
+            np.testing.assert_allclose(
+                actual.reshape(-1),
+                self.ref[name].reshape(-1),
+                rtol=1e-10,
+                atol=1e-10,
+                err_msg=name,
+            )
+        np.testing.assert_array_equal(
+            mask_mag.reshape(-1),
+            self.ref["mask_mag"].reshape(-1),
+        )
+
+
+class _SpinFilesMixin:
+    """Build .pt + .pte for the chosen ``spin_config`` once per class."""
+
+    spin_config: dict  # set by subclasses
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        from .test_deep_eval_spin import (
+            ATYPE,
+            BOX,
+            COORD,
+            SPIN,
+        )
+
+        cls.ATYPE = ATYPE
+        cls.BOX = BOX
+        cls.COORD = COORD
+        cls.SPIN = SPIN
+
+        cls.files = _make_spin_files(cls.spin_config)
+        cls.model = cls.files["model"]
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        # Robust against unexpected leftover files in tmpdir.
+        shutil.rmtree(cls.files["tmpdir"], ignore_errors=True)
+
+
+class TestPtExptLoadPtSpin(_SpinFilesMixin, unittest.TestCase):
+    """Vanilla spin model: `.pt` loads, runs, matches eager reference."""
+
+    spin_config = None  # populated in setUpClass
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        from .test_deep_eval_spin import (
+            SPIN_CONFIG,
+        )
+
+        cls.spin_config = copy.deepcopy(SPIN_CONFIG)
+        super().setUpClass()
+        cls.ref = _spin_eager_reference(
+            cls.model, cls.COORD, cls.ATYPE, cls.SPIN, cls.BOX
+        )
+
+    def test_metadata_flags_spin(self) -> None:
+        dp = DeepPot(self.files[".pt"])
+        self.assertTrue(dp.has_spin)
+        self.assertEqual(dp.use_spin, [True, False])
+        self.assertTrue(dp.deep_eval._is_spin)
+
+    def test_eval_pbc_atomic_matches_reference(self) -> None:
+        dp = DeepPot(self.files[".pt"])
+        e, f, v, ae, _av, fm, _mm = dp.eval(
+            self.COORD, self.BOX, self.ATYPE, atomic=True, spin=self.SPIN
+        )
+        np.testing.assert_allclose(
+            e.reshape(-1), self.ref["energy"].reshape(-1), rtol=1e-10, atol=1e-10
+        )
+        np.testing.assert_allclose(
+            ae.reshape(-1),
+            self.ref["atom_energy"].reshape(-1),
+            rtol=1e-10,
+            atol=1e-10,
+        )
+        np.testing.assert_allclose(
+            f.reshape(-1), self.ref["force"].reshape(-1), rtol=1e-10, atol=1e-10
+        )
+        np.testing.assert_allclose(
+            fm.reshape(-1),
+            self.ref["force_mag"].reshape(-1),
+            rtol=1e-10,
+            atol=1e-10,
+        )
+        np.testing.assert_allclose(
+            v.reshape(-1), self.ref["virial"].reshape(-1), rtol=1e-10, atol=1e-10
+        )
+
+    def test_eval_requires_spin_argument(self) -> None:
+        dp = DeepPot(self.files[".pt"])
+        with pytest.raises(ValueError, match="no `spin` argument was provided"):
+            dp.eval(self.COORD, self.BOX, self.ATYPE)
+
+    def test_pt_pte_consistency_atomic(self) -> None:
+        """`.pt` (eager) and `.pte` (torch.export) outputs must agree (atomic=True).
+
+        Per-atom virial is skipped: spin's per-extended-atom virial diverges
+        between the eager and exported paths in a way that is not yet
+        understood; the reduced virial / force / atom_energy / mask_mag /
+        force_mag all match bit-for-bit.
+        """
+        dp_pt = DeepPot(self.files[".pt"])
+        dp_pte = DeepPot(self.files[".pte"])
+        out_pt = dp_pt.eval(
+            self.COORD, self.BOX, self.ATYPE, atomic=True, spin=self.SPIN
+        )
+        out_pte = dp_pte.eval(
+            self.COORD, self.BOX, self.ATYPE, atomic=True, spin=self.SPIN
+        )
+        names = (
+            "energy",
+            "force",
+            "virial",
+            "atom_energy",
+            None,  # atom_virial — known spin divergence
+            "force_mag",
+            "mask_mag",
+        )
+        for name, a, b in zip(names, out_pt, out_pte, strict=False):
+            if name is None:
+                continue
+            np.testing.assert_allclose(
+                a,
+                b,
+                rtol=1e-10,
+                atol=1e-10,
+                err_msg=f"pt vs pte mismatch on {name}",
+            )
+
+
+class TestPtExptLoadPtSpinFparam(_SpinFilesMixin, unittest.TestCase):
+    """Spin model with ``numb_fparam=1`` and a default fparam."""
+
+    spin_config = None
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        from .test_deep_eval_spin import (
+            SPIN_CONFIG,
+        )
+
+        cfg = copy.deepcopy(SPIN_CONFIG)
+        cfg["fitting_net"]["numb_fparam"] = 1
+        cfg["fitting_net"]["default_fparam"] = [0.5]
+        cls.spin_config = cfg
+        super().setUpClass()
+
+    def test_default_fparam_matches_explicit_pt(self) -> None:
+        dp = DeepPot(self.files[".pt"])
+        e_no, f_no, v_no, fm_no, _ = dp.eval(
+            self.COORD, self.BOX, self.ATYPE, atomic=False, spin=self.SPIN
+        )
+        e_ex, f_ex, v_ex, fm_ex, _ = dp.eval(
+            self.COORD,
+            self.BOX,
+            self.ATYPE,
+            atomic=False,
+            spin=self.SPIN,
+            fparam=[0.5],
+        )
+        np.testing.assert_allclose(e_no, e_ex, atol=1e-10)
+        np.testing.assert_allclose(f_no, f_ex, atol=1e-10)
+        np.testing.assert_allclose(v_no, v_ex, atol=1e-10)
+        np.testing.assert_allclose(fm_no, fm_ex, atol=1e-10)
+
+    def test_fparam_changes_output_pt(self) -> None:
+        """Different fparam values must produce different energies."""
+        dp = DeepPot(self.files[".pt"])
+        e0, *_ = dp.eval(
+            self.COORD,
+            self.BOX,
+            self.ATYPE,
+            atomic=False,
+            spin=self.SPIN,
+            fparam=[0.0],
+        )
+        e1, *_ = dp.eval(
+            self.COORD,
+            self.BOX,
+            self.ATYPE,
+            atomic=False,
+            spin=self.SPIN,
+            fparam=[1.0],
+        )
+        self.assertFalse(
+            np.allclose(e0, e1),
+            "Changing fparam did not change output — fparam may be ignored",
+        )
+
+    def test_pt_pte_consistency_default_fparam(self) -> None:
+        """Without an explicit fparam both backends must use ``default_fparam``."""
+        dp_pt = DeepPot(self.files[".pt"])
+        dp_pte = DeepPot(self.files[".pte"])
+        out_pt = dp_pt.eval(
+            self.COORD, self.BOX, self.ATYPE, atomic=True, spin=self.SPIN
+        )
+        out_pte = dp_pte.eval(
+            self.COORD, self.BOX, self.ATYPE, atomic=True, spin=self.SPIN
+        )
+        names = (
+            "energy",
+            "force",
+            "virial",
+            "atom_energy",
+            None,  # atom_virial — known spin divergence
+            "force_mag",
+            "mask_mag",
+        )
+        for name, a, b in zip(names, out_pt, out_pte, strict=False):
+            if name is None:
+                continue
+            np.testing.assert_allclose(
+                a,
+                b,
+                rtol=1e-10,
+                atol=1e-10,
+                err_msg=f"pt vs pte mismatch (default fparam) on {name}",
+            )
+
+
+class TestPtExptLoadPtSpinAparam(_SpinFilesMixin, unittest.TestCase):
+    """Spin model with ``numb_aparam=2``."""
+
+    spin_config = None
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        from .test_deep_eval_spin import (
+            SPIN_CONFIG,
+        )
+
+        cfg = copy.deepcopy(SPIN_CONFIG)
+        cfg["fitting_net"]["numb_aparam"] = 2
+        cls.spin_config = cfg
+        super().setUpClass()
+
+    def test_aparam_changes_output_pt(self) -> None:
+        dp = DeepPot(self.files[".pt"])
+        natoms = len(self.ATYPE)
+        ap0 = np.zeros(natoms * 2, dtype=np.float64)
+        ap1 = np.full(natoms * 2, 0.5, dtype=np.float64)
+        e0, *_ = dp.eval(
+            self.COORD,
+            self.BOX,
+            self.ATYPE,
+            atomic=False,
+            spin=self.SPIN,
+            aparam=ap0,
+        )
+        e1, *_ = dp.eval(
+            self.COORD,
+            self.BOX,
+            self.ATYPE,
+            atomic=False,
+            spin=self.SPIN,
+            aparam=ap1,
+        )
+        self.assertFalse(
+            np.allclose(e0, e1),
+            "Changing aparam did not change output — aparam may be ignored",
+        )
+
+    def test_eval_without_aparam_raises_pt(self) -> None:
+        dp = DeepPot(self.files[".pt"])
+        with pytest.raises(ValueError, match="aparam is required"):
+            dp.eval(self.COORD, self.BOX, self.ATYPE, atomic=False, spin=self.SPIN)
+
+    def test_pt_pte_consistency_with_aparam_atomic(self) -> None:
+        """`.pt` ↔ `.pte` consistency with explicit aparam, atomic=True."""
+        dp_pt = DeepPot(self.files[".pt"])
+        dp_pte = DeepPot(self.files[".pte"])
+        natoms = len(self.ATYPE)
+        ap = np.full(natoms * 2, 0.5, dtype=np.float64)
+        out_pt = dp_pt.eval(
+            self.COORD,
+            self.BOX,
+            self.ATYPE,
+            atomic=True,
+            spin=self.SPIN,
+            aparam=ap,
+        )
+        out_pte = dp_pte.eval(
+            self.COORD,
+            self.BOX,
+            self.ATYPE,
+            atomic=True,
+            spin=self.SPIN,
+            aparam=ap,
+        )
+        names = (
+            "energy",
+            "force",
+            "virial",
+            "atom_energy",
+            None,  # atom_virial — known spin divergence
+            "force_mag",
+            "mask_mag",
+        )
+        for name, a, b in zip(names, out_pt, out_pte, strict=False):
+            if name is None:
+                continue
+            np.testing.assert_allclose(
+                a,
+                b,
+                rtol=1e-10,
+                atol=1e-10,
+                err_msg=f"pt vs pte mismatch (aparam, atomic) on {name}",
+            )
+
+
+class TestPtExptLoadPtSpinMultiTask(unittest.TestCase):
+    """Multi-task `.pt` checkpoint with spin heads on every branch."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        from deepmd.pt_expt.model import get_model as pt_expt_get_model
+
+        from .test_deep_eval_spin import (
+            ATYPE,
+            BOX,
+            COORD,
+            SPIN,
+            SPIN_CONFIG,
+        )
+
+        cls.ATYPE = ATYPE
+        cls.BOX = BOX
+        cls.COORD = COORD
+        cls.SPIN = SPIN
+
+        # Two spin heads with the same architecture but built from independent
+        # random init (different seeds) so we can detect head-routing bugs.
+        cfg_a = copy.deepcopy(SPIN_CONFIG)
+        cfg_a["descriptor"]["seed"] = 42
+        cfg_a["fitting_net"]["seed"] = 42
+        cfg_b = copy.deepcopy(SPIN_CONFIG)
+        cfg_b["descriptor"]["seed"] = 7
+        cfg_b["fitting_net"]["seed"] = 7
+
+        cls.model_a = (
+            pt_expt_get_model(copy.deepcopy(cfg_a)).to(torch.float64).to(DEVICE).eval()
+        )
+        cls.model_b = (
+            pt_expt_get_model(copy.deepcopy(cfg_b)).to(torch.float64).to(DEVICE).eval()
+        )
+
+        wrapper = ModelWrapper(
+            {"head_a": cls.model_a, "head_b": cls.model_b},
+            model_params={"model_dict": {"head_a": cfg_a, "head_b": cfg_b}},
+        )
+        cls.pt_path = tempfile.NamedTemporaryFile(suffix=".pt", delete=False).name
+        torch.save({"model": wrapper.state_dict()}, cls.pt_path)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        if os.path.exists(cls.pt_path):
+            os.unlink(cls.pt_path)
+
+    def _eager_ref(self, model) -> dict:
+        return _spin_eager_reference(model, self.COORD, self.ATYPE, self.SPIN, self.BOX)
+
+    def test_each_head_matches_its_eager_reference(self) -> None:
+        for head, src in (("head_a", self.model_a), ("head_b", self.model_b)):
+            dp = DeepPot(self.pt_path, head=head)
+            self.assertTrue(dp.has_spin, msg=f"head={head}")
+            self.assertEqual(dp.use_spin, [True, False], msg=f"head={head}")
+
+            ref = self._eager_ref(src)
+            e, f, v, _ae, _av, fm, _mm = dp.eval(
+                self.COORD, self.BOX, self.ATYPE, atomic=True, spin=self.SPIN
+            )
+            np.testing.assert_allclose(
+                e.reshape(-1),
+                ref["energy"].reshape(-1),
+                rtol=1e-10,
+                atol=1e-10,
+                err_msg=f"head={head}, energy",
+            )
+            np.testing.assert_allclose(
+                f.reshape(-1),
+                ref["force"].reshape(-1),
+                rtol=1e-10,
+                atol=1e-10,
+                err_msg=f"head={head}, force",
+            )
+            np.testing.assert_allclose(
+                fm.reshape(-1),
+                ref["force_mag"].reshape(-1),
+                rtol=1e-10,
+                atol=1e-10,
+                err_msg=f"head={head}, force_mag",
+            )
+            np.testing.assert_allclose(
+                v.reshape(-1),
+                ref["virial"].reshape(-1),
+                rtol=1e-10,
+                atol=1e-10,
+                err_msg=f"head={head}, virial",
+            )
+
+    def test_distinct_heads_produce_distinct_outputs(self) -> None:
+        """Sanity check that head_a and head_b really are different models."""
+        dp_a = DeepPot(self.pt_path, head="head_a")
+        dp_b = DeepPot(self.pt_path, head="head_b")
+        e_a = dp_a.eval(self.COORD, self.BOX, self.ATYPE, atomic=False, spin=self.SPIN)[
+            0
+        ]
+        e_b = dp_b.eval(self.COORD, self.BOX, self.ATYPE, atomic=False, spin=self.SPIN)[
+            0
+        ]
+        self.assertFalse(
+            np.allclose(e_a, e_b),
+            "head_a and head_b produced identical outputs — head selection "
+            "may be loading the wrong weights",
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

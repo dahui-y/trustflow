@@ -1,0 +1,930 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
+from collections.abc import (
+    Callable,
+)
+from typing import (
+    Any,
+)
+
+import array_api_compat
+import numpy as np
+
+from deepmd.dpmodel.array_api import (
+    Array,
+)
+from deepmd.dpmodel.utils.nlist import (
+    build_multiple_neighbor_list,
+    get_multiple_nlist_key,
+    nlist_distinguish_types,
+)
+from deepmd.utils.path import (
+    DPPath,
+)
+from deepmd.utils.version import (
+    check_version_compatibility,
+)
+
+from ..output_def import (
+    FittingOutputDef,
+    OutputVariableDef,
+)
+from .base_atomic_model import (
+    BaseAtomicModel,
+)
+from .dp_atomic_model import (
+    DPAtomicModel,
+)
+from .pairtab_atomic_model import (
+    PairTabAtomicModel,
+)
+
+
+@BaseAtomicModel.register("linear")
+@BaseAtomicModel.register("linear_ener")  # accepted alias, never emitted
+class LinearEnergyAtomicModel(BaseAtomicModel):
+    r"""Linear model makes linear combinations of several existing models.
+
+    The linear model combines predictions from multiple atomic models:
+
+    .. math::
+        E^i = \sum_{k=1}^{K} w_k \cdot E_k^i,
+
+    where :math:`E_k^i` is the energy predicted by the :math:`k`-th sub-model
+    for atom :math:`i`, and :math:`w_k` is the corresponding weight.
+
+    This is useful for combining different interaction types, e.g., DP + ZBL
+    for short-range repulsion, or DP + D3 for dispersion corrections.
+
+    Parameters
+    ----------
+    models : list[DPAtomicModel or PairTabAtomicModel]
+        A list of models to be combined. PairTabAtomicModel must be used together with a DPAtomicModel.
+    type_map : list[str]
+        Mapping atom type to the name (str) of the type.
+        For example `type_map[1]` gives the name of the type 1.
+    """
+
+    def __init__(
+        self,
+        models: list[BaseAtomicModel],
+        type_map: list[str],
+        weights: str | list[float] = "mean",
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(type_map, **kwargs)
+        super().init_out_stat()
+
+        # check all sub models are of mixed type.
+        model_mixed_type = []
+        for m in models:
+            if not m.mixed_types():
+                model_mixed_type.append(m)
+        if len(model_mixed_type) > 0:
+            raise ValueError(
+                f"LinearAtomicModel only supports AtomicModel of mixed type, the following models are not mixed type: {model_mixed_type}."
+            )
+
+        # Fail fast: a sum mixing an intensive with an extensive term is not
+        # physically meaningful, so such a composition must not exist.
+        intensive_flags = {m.get_intensive() for m in models}
+        if len(intensive_flags) > 1:
+            raise ValueError(
+                "LinearAtomicModel cannot combine intensive and extensive "
+                "sub-models: "
+                + ", ".join(f"{type(m).__name__}={m.get_intensive()}" for m in models)
+            )
+
+        # Fail fast: the composition feeds ONE external fparam/aparam tensor to
+        # every child, so all children that actually consume it must agree on
+        # its dimension. Children with dimension 0 do not consume it and are
+        # ignored, so a learned model composed with an analytical term (ZBL)
+        # simply inherits the learned dimension.
+        for name, dim_of in (
+            ("fparam", lambda m: m.get_dim_fparam()),
+            ("aparam", lambda m: m.get_dim_aparam()),
+        ):
+            dims = {dim_of(m) for m in models if dim_of(m) > 0}
+            if len(dims) > 1:
+                raise ValueError(
+                    f"LinearAtomicModel sub-models disagree on the {name} "
+                    "dimension, but the composition feeds them one shared "
+                    "tensor: "
+                    + ", ".join(f"{type(m).__name__}={dim_of(m)}" for m in models)
+                )
+
+        self.models = models
+        self.type_map = type_map
+        self._rebuild_mapping_state()
+        self.mixed_types_list = [model.mixed_types() for model in self.models]
+        if isinstance(weights, str):
+            assert weights in ["sum", "mean"]
+        elif isinstance(weights, list):
+            assert len(weights) == len(models)
+        else:
+            raise ValueError(
+                f"'weights' must be a string ('sum' or 'mean') or a list of float of length {len(models)}."
+            )
+        self.weights = weights
+
+    def adam_route_patterns(self) -> list[str]:
+        """Collect child AdamW patterns under their indexed parameter paths."""
+        return [
+            f"models.{index}.{pattern}"
+            for index, model in enumerate(self.models)
+            for pattern in model.adam_route_patterns()
+        ]
+
+    def _rebuild_mapping_state(self) -> None:
+        """Rebuild ``mapping_list`` and everything derived from it.
+
+        The ONE owner of the mapping state: called at construction and after
+        ``change_type_map`` (submodels may reorder or add species).
+        ``_graph_mapping_is_identity`` is a static composition property
+        computed EAGERLY here: the graph route requires identity atype
+        mappings, and checking at forward time would iterate (possibly
+        traced) tensors and trip ``torch.export``'s data-dependent guards.
+        """
+        self.mapping_list = self._build_mapping_list()
+        self._graph_mapping_is_identity = all(
+            list(m) == list(range(len(m))) for m in self.mapping_list
+        )
+
+    def _build_mapping_list(self) -> list[Array]:
+        """Map common type IDs to the current type IDs of every submodel."""
+        common_type_map = set(self.type_map)
+        mapping_list = []
+        err_msg = []
+        for model in self.models:
+            submodel_type_map = model.get_type_map()
+            if not common_type_map.issubset(set(submodel_type_map)):
+                missing_types = [
+                    atom_type
+                    for atom_type in self.type_map
+                    if atom_type not in submodel_type_map
+                ]
+                err_msg.append(
+                    f"type_map {self.type_map} contains types {missing_types} "
+                    f"not supported by submodel type_map {submodel_type_map}"
+                )
+                # remap_atype assumes every common type exists in the submodel.
+                # Defer the combined validation error instead of leaking KeyError.
+                continue
+            mapping_list.append(self.remap_atype(submodel_type_map, self.type_map))
+        if err_msg:
+            raise ValueError("\n".join(err_msg))
+        return mapping_list
+
+    def mixed_types(self) -> bool:
+        """If true, the model
+        1. assumes total number of atoms aligned across frames;
+        2. uses a neighbor list that does not distinguish different atomic types.
+
+        If false, the model
+        1. assumes total number of atoms of each atom type aligned across frames;
+        2. uses a neighbor list that distinguishes different atomic types.
+
+        """
+        return True
+
+    def has_message_passing(self) -> bool:
+        """Returns whether the atomic model has message passing."""
+        return any(model.has_message_passing() for model in self.models)
+
+    def has_message_passing_across_ranks(self) -> bool:
+        """ANY child needing the exchange makes the composition need it."""
+        return any(m.has_message_passing_across_ranks() for m in self.models)
+
+    def supports_edge_parallel(self) -> bool:
+        """EVERY child must tolerate decomposition; one veto vetoes all."""
+        return all(m.supports_edge_parallel() for m in self.models)
+
+    def dense_lower_supports_comm(self) -> bool:
+        """The shared dense lower is only comm-capable if every child's is."""
+        return all(m.dense_lower_supports_comm() for m in self.models)
+
+    def uses_compact_edge_pairs(self) -> bool:
+        """The export guard fires if ANY child emits compact pairs."""
+        return any(m.uses_compact_edge_pairs() for m in self.models)
+
+    def graph_edge_dtype(self) -> str:
+        """One shared edge tensor: float32 only if EVERY child accepts it."""
+        dtypes = {m.graph_edge_dtype() for m in self.models}
+        return "float32" if dtypes == {"float32"} else "float64"
+
+    def supports_graph_export(self) -> bool:
+        """All children trace into one artifact; each must be exportable."""
+        return all(m.supports_graph_export() for m in self.models)
+
+    def need_sorted_nlist_for_lower(self) -> bool:
+        """Returns whether the atomic model needs sorted nlist when using `forward_lower`."""
+        return True
+
+    def get_rcut(self) -> float:
+        """Get the cut-off radius."""
+        return max(self.get_model_rcuts())
+
+    def get_type_map(self) -> list[str]:
+        """Get the type map."""
+        return self.type_map
+
+    def fold_vacuum_reference(self) -> None:
+        """Fold the vacuum reference of every sub-model into its bias."""
+        for model in self.models:
+            model.fold_vacuum_reference()
+
+    def change_type_map(
+        self, type_map: list[str], model_with_new_type_stat: Any | None = None
+    ) -> None:
+        """Change the type related params to new ones, according to `type_map` and the original one in the model.
+        If there are new types in `type_map`, statistics will be updated accordingly to `model_with_new_type_stat` for these new types.
+        """
+        super().change_type_map(
+            type_map=type_map, model_with_new_type_stat=model_with_new_type_stat
+        )
+        for ii, model in enumerate(self.models):
+            model.change_type_map(
+                type_map=type_map,
+                model_with_new_type_stat=model_with_new_type_stat.models[ii]
+                if model_with_new_type_stat is not None
+                else None,
+            )
+        # Submodels may reorder existing species or add new ones.  Rebuild only
+        # after every submodel has changed so runtime type IDs use their new maps
+        # (also refreshes the derived _graph_mapping_is_identity flag).
+        self._rebuild_mapping_state()
+
+    def get_model_rcuts(self) -> list[float]:
+        """Get the cut-off radius for each individual models."""
+        return [model.get_rcut() for model in self.models]
+
+    def get_sel(self) -> list[int]:
+        return [max([model.get_nsel() for model in self.models])]
+
+    def set_case_embd(self, case_idx: int) -> None:
+        """
+        Set the case embedding of this atomic model by the given case_idx,
+        typically concatenated with the output of the descriptor and fed into the fitting net.
+        """
+        for model in self.models:
+            model.set_case_embd(case_idx)
+
+    def get_model_nsels(self) -> list[int]:
+        """Get the processed sels for each individual models. Not distinguishing types."""
+        return [model.get_nsel() for model in self.models]
+
+    def get_model_sels(self) -> list[int | list[int]]:
+        """Get the sels for each individual models."""
+        return [model.get_sel() for model in self.models]
+
+    def _sort_rcuts_sels(self) -> tuple[list[float], list[int]]:
+        # sort the pair of rcut and sels in ascending order, first based on sel, then on rcut.
+        zipped = sorted(
+            zip(self.get_model_rcuts(), self.get_model_nsels(), strict=True),
+            key=lambda x: (x[1], x[0]),
+        )
+        return [p[0] for p in zipped], [p[1] for p in zipped]
+
+    def enable_compression(
+        self,
+        min_nbor_dist: float,
+        table_extrapolate: float = 5,
+        table_stride_1: float = 0.01,
+        table_stride_2: float = 0.1,
+        check_frequency: int = -1,
+    ) -> None:
+        """Compress model.
+
+        Parameters
+        ----------
+        min_nbor_dist
+            The nearest distance between atoms
+        table_extrapolate
+            The scale of model extrapolation
+        table_stride_1
+            The uniform stride of the first table
+        table_stride_2
+            The uniform stride of the second table
+        check_frequency
+            The overflow check frequency
+        """
+        for model in self.models:
+            model.enable_compression(
+                min_nbor_dist,
+                table_extrapolate,
+                table_stride_1,
+                table_stride_2,
+                check_frequency,
+            )
+
+    def compression_needs_min_nbor_dist(self) -> bool:
+        """Required as soon as ANY child consumes it.
+
+        The statistic is measured once and handed to every child, so a single
+        child that tabulates from the shortest observed distance keeps the
+        neighbor-statistics pass for the whole composition.
+        """
+        return any(m.compression_needs_min_nbor_dist() for m in self.models)
+
+    def uses_graph_lower(self) -> bool:
+        """Graph-capable iff EVERY child supports the graph lower.
+
+        All children evaluate on the one shared graph, so a single
+        dense-only child (e.g. ``PairTabAtomicModel`` in standard DP+ZBL)
+        forces the whole composition onto the dense route; a graph
+        descriptor plus an analytical graph term (ZBL bridging) stays on the
+        graph route.
+        """
+        return all(m.uses_graph_lower() for m in self.models)
+
+    def supports_native_spin(self) -> bool:
+        """Spin-capable when ANY child consumes the spin input.
+
+        Unlike :meth:`uses_graph_lower` (every child must run on the shared
+        graph), spin only has to reach ONE consumer: analytical terms accept
+        and ignore it, so a composition of a spin-aware learned model with a
+        ZBL term is a valid native-spin model.  With no consumer at all the
+        magnetic force would be identically zero, which is not a spin model.
+        """
+        return any(m.supports_native_spin() for m in self.models)
+
+    def forward_atomic_graph(
+        self,
+        graph: Any,
+        atype: Array,
+        fparam: Array | None = None,
+        aparam: Array | None = None,
+        charge_spin: Array | None = None,
+        spin: Array | None = None,
+        comm_dict: dict | None = None,
+    ) -> dict[str, Array]:
+        """Graph-route linear combination on the flat node axis.
+
+        Every child consumes the SAME graph, so on autograd backends the
+        shared ``graph.edge_vec`` leaf makes the summed energy's force and
+        virial exactly the sum of the children's -- one edge backward
+        covers the whole composition (this is what makes analytical
+        bridging terms compose with the learned model for free).
+
+        Only constant weights are supported here (``"sum"``/``"mean"`` or a
+        per-child float list); the distance-switched ZBL-interpolation
+        weights are a dense-route feature. Children with distinct type maps
+        are not supported on the graph route.
+
+        Parameters
+        ----------
+        graph
+            neighbor graph for the local atoms (ghost-free).
+        atype
+            flat local atom types. N
+        fparam
+            frame parameter. nf x ndf
+        aparam
+            atomic parameter. N x nda
+        charge_spin
+            frame-level conditioning, forwarded to every child (children
+            gate it on their own capabilities).
+        spin
+            flat (N, 3) per-node spin, forwarded to every child.
+        comm_dict
+            MPI communication metadata, forwarded to every child.
+
+        Returns
+        -------
+        dict
+            ``{"energy": (N, 1)}`` -- the weighted sum of the children's
+            per-atom energies.
+
+        Raises
+        ------
+        NotImplementedError
+            For non-constant weights or children with remapped type maps.
+        """
+        import array_api_compat
+
+        if not self._graph_mapping_is_identity:
+            raise NotImplementedError(
+                "the graph route supports children sharing the parent "
+                "type_map only (no atype remapping)"
+            )
+        nmodels = len(self.models)
+        if self.weights == "sum":
+            weights = [1.0] * nmodels
+        elif self.weights == "mean":
+            weights = [1.0 / nmodels] * nmodels
+        elif isinstance(self.weights, list):
+            weights = [float(w) for w in self.weights]
+        else:
+            raise NotImplementedError(
+                "the graph route supports constant weights only "
+                "('sum'/'mean'/list); distance-switched weights are a "
+                "dense-route feature"
+            )
+        xp = array_api_compat.array_namespace(graph.edge_vec)
+        energy = None
+        for model, ww in zip(self.models, weights, strict=True):
+            ret = model.forward_common_atomic_graph(
+                graph,
+                atype,
+                fparam=fparam,
+                aparam=aparam,
+                charge_spin=charge_spin,
+                spin=spin,
+                comm_dict=comm_dict,
+            )
+            contrib = ret["energy"] * ww
+            energy = contrib if energy is None else energy + contrib
+        return {"energy": xp.astype(energy, graph.edge_vec.dtype)}
+
+    def forward_atomic(
+        self,
+        extended_coord: Array,
+        extended_atype: Array,
+        nlist: Array,
+        mapping: Array | None = None,
+        fparam: Array | None = None,
+        aparam: Array | None = None,
+        comm_dict: dict | None = None,
+        charge_spin: Array | None = None,
+    ) -> dict[str, Array]:
+        """Return atomic prediction.
+
+        Parameters
+        ----------
+        extended_coord
+            coordinates in extended region, (nframes, nall * 3)
+        extended_atype
+            atomic type in extended region, (nframes, nall)
+        nlist
+            neighbor list, (nframes, nloc, nsel).
+        mapping
+            mapps the extended indices to local indices.
+        fparam
+            frame parameter. (nframes, ndf)
+        aparam
+            atomic parameter. (nframes, nloc, nda)
+        comm_dict
+            MPI communication metadata. Forwarded to each sub-model so GNN
+            sub-descriptors can perform parallel ghost exchange. ``None`` for
+            non-parallel inference (default).
+
+        Returns
+        -------
+        result_dict
+            the result dict, defined by the fitting net output def.
+        """
+        xp = array_api_compat.array_namespace(extended_coord, extended_atype, nlist)
+        nframes, _nloc, _nnei = nlist.shape
+        extended_coord = xp.reshape(extended_coord, (nframes, -1, 3))
+        sorted_rcuts, sorted_sels = self._sort_rcuts_sels()
+        nlists = build_multiple_neighbor_list(
+            extended_coord,
+            nlist,
+            sorted_rcuts,
+            sorted_sels,
+        )
+        raw_nlists = [
+            nlists[get_multiple_nlist_key(rcut, sel)]
+            for rcut, sel in zip(
+                self.get_model_rcuts(), self.get_model_nsels(), strict=True
+            )
+        ]
+        nlists_ = [
+            nl if mt else nlist_distinguish_types(nl, extended_atype, sel)
+            for mt, nl, sel in zip(
+                self.mixed_types_list, raw_nlists, self.get_model_sels(), strict=True
+            )
+        ]
+        ener_list = []
+        for i, model in enumerate(self.models):
+            type_map_model = self.mapping_list[i]
+            ener_list.append(
+                model.forward_atomic(
+                    extended_coord,
+                    type_map_model[extended_atype],
+                    nlists_[i],
+                    mapping,
+                    fparam,
+                    aparam,
+                    comm_dict,
+                    charge_spin=charge_spin,
+                )["energy"]
+            )
+        weights = self._compute_weight(extended_coord, extended_atype, nlists_)
+
+        fit_ret = {
+            "energy": xp.sum(xp.stack(ener_list) * xp.stack(weights), axis=0),
+        }  # (nframes, nloc, 1)
+        return fit_ret
+
+    @staticmethod
+    def remap_atype(ori_map: list[str], new_map: list[str]) -> Array:
+        """
+        This method is used to map the atype from the common type_map to the original type_map of
+        indivial AtomicModels.
+
+        Parameters
+        ----------
+        ori_map : list[str]
+            The original type map of an AtomicModel.
+        new_map : list[str]
+            The common type map of the DPZBLLinearEnergyAtomicModel, created by the `get_type_map` method,
+            must be a subset of the ori_map.
+
+        Returns
+        -------
+        np.ndarray
+        """
+        type_2_idx = {atp: idx for idx, atp in enumerate(ori_map)}
+        # this maps the atype in the new map to the original map
+        mapping = np.array([type_2_idx[new_map[idx]] for idx in range(len(new_map))])
+        return mapping
+
+    def fitting_output_def(self) -> FittingOutputDef:
+        return FittingOutputDef(
+            [
+                OutputVariableDef(
+                    name="energy",
+                    shape=[1],
+                    reducible=True,
+                    r_differentiable=True,
+                    c_differentiable=True,
+                )
+            ]
+        )
+
+    def serialize(self) -> dict:
+        dd = super().serialize()
+        dd.update(
+            {
+                "@class": "Model",
+                "@version": 3,
+                # ONE wire type across backends: pt/tf write "linear" here, so
+                # dpmodel must too or cross-backend conversion breaks.  The
+                # unambiguous energy-specific name lives in the config/model
+                # registry ("linear_ener"), which is also accepted here.
+                "type": "linear",
+                "models": [model.serialize() for model in self.models],
+                "type_map": self.type_map,
+                "weights": self.weights,
+            }
+        )
+        return dd
+
+    @classmethod
+    def deserialize(cls, data: dict) -> "LinearEnergyAtomicModel":
+        data = data.copy()
+        check_version_compatibility(data.pop("@version", 2), 3, 2)
+        data.pop("@class", None)
+        data.pop("type", None)
+        if "weights" not in data:
+            data["weights"] = "mean"
+        models = [
+            BaseAtomicModel.get_class_by_type(model["type"]).deserialize(model)
+            for model in data["models"]
+        ]
+        data["models"] = models
+        return super().deserialize(data)
+
+    def compute_or_load_stat(
+        self,
+        sampled_func: Callable[[], list[dict]],
+        stat_file_path: DPPath | None = None,
+        compute_or_load_out_stat: bool = True,
+        preset_observed_type: list[str] | None = None,
+    ) -> None:
+        """Compute or load the statistics parameters of the model.
+
+        For LinearEnergyAtomicModel, this first computes input stats for each
+        sub-model (without output stats), then computes its own output stats.
+
+        Parameters
+        ----------
+        sampled_func
+            The lazy sampled function to get data frames from different data systems.
+        stat_file_path
+            The path to the stat file.
+        compute_or_load_out_stat : bool
+            Whether to compute the output statistics.
+        """
+        # Compute observed type once at parent level, then propagate to
+        # sub-models via preset_observed_type to avoid redundant computation.
+        obs_stat_path = stat_file_path
+        if obs_stat_path is not None and self.type_map is not None:
+            obs_stat_path = obs_stat_path / " ".join(self.type_map)
+        self._collect_and_set_observed_type(
+            sampled_func, obs_stat_path, preset_observed_type
+        )
+
+        for md in self.models:
+            md.compute_or_load_stat(
+                sampled_func,
+                stat_file_path,
+                compute_or_load_out_stat=False,
+                preset_observed_type=self._observed_type,
+            )
+
+        if stat_file_path is not None and self.type_map is not None:
+            stat_file_path /= " ".join(self.type_map)
+
+        if compute_or_load_out_stat:
+            wrapped_sampler = self._make_wrapped_sampler(sampled_func)
+            self.compute_or_load_out_stat(wrapped_sampler, stat_file_path)
+
+    def _compute_weight(
+        self,
+        extended_coord: Array,
+        extended_atype: Array,
+        nlists_: list[Array],
+    ) -> list[Array]:
+        """This should be a list of user defined weights that matches the number of models to be combined."""
+        xp = array_api_compat.array_namespace(extended_coord, extended_atype)
+        nmodels = len(self.models)
+        nframes, nloc, _ = nlists_[0].shape
+        dev = array_api_compat.device(extended_coord)
+        if isinstance(self.weights, str):
+            if self.weights == "sum":
+                return [
+                    xp.ones((nframes, nloc, 1), dtype=extended_coord.dtype, device=dev)
+                    for _ in range(nmodels)
+                ]
+            elif self.weights == "mean":
+                return [
+                    xp.ones((nframes, nloc, 1), dtype=extended_coord.dtype, device=dev)
+                    / nmodels
+                    for _ in range(nmodels)
+                ]
+            else:
+                raise ValueError(
+                    "`weights` must be 'sum' or 'mean' when provided as a string."
+                )
+        elif isinstance(self.weights, list):
+            return [
+                xp.ones((nframes, nloc, 1), dtype=extended_coord.dtype, device=dev) * w
+                for w in self.weights
+            ]
+        else:
+            raise NotImplementedError
+
+    def get_dim_fparam(self) -> int:
+        """Get the number (dimension) of frame parameters of this atomic model.
+
+        ``max`` is exact here, not a guess: ``__init__`` rejects consumers
+        that disagree, so the only other value present is 0 from a
+        non-consumer.
+        """
+        return max([model.get_dim_fparam() for model in self.models])
+
+    def get_dim_aparam(self) -> int:
+        """Get the number (dimension) of atomic parameters of this atomic model.
+
+        ``max`` is exact for the same reason as :meth:`get_dim_fparam`.
+        """
+        return max([model.get_dim_aparam() for model in self.models])
+
+    # --- conditioning-input capabilities owned by the children -----------
+    # A composition must FORWARD every capability its children own, exactly
+    # like get_dim_fparam/get_dim_aparam above.  Falling through to
+    # BaseAtomicModel's False/0 is silently wrong: eager forward still
+    # conditions on the input (the learned child consumes it), but the
+    # freeze reads these accessors, so a 0 here drops the charge_spin slot
+    # from the exported ABI and from the metadata the C++ feeder uses --
+    # the artifact then disagrees with its own eager model.
+
+    def has_chg_spin_ebd(self) -> bool:
+        """Whether ANY child consumes the frame-level charge/spin FiLM input."""
+        return any(model.has_chg_spin_ebd() for model in self.models)
+
+    def get_intensive(self) -> bool:
+        """Whether the composed property is intensive.
+
+        All children agree by construction (validated in ``__init__``).
+        """
+        return self.models[0].get_intensive() if self.models else False
+
+    def get_compute_stats_distinguish_types(self) -> bool:
+        """Needed if ANY child needs them; the stricter rule is safe for
+        children that do not distinguish types.
+        """
+        return any(model.get_compute_stats_distinguish_types() for model in self.models)
+
+    def get_dim_chg_spin(self) -> int:
+        """Dimension of the charge_spin input (max over children, like fparam)."""
+        return max([model.get_dim_chg_spin() for model in self.models])
+
+    @staticmethod
+    def _agreed_default(
+        actives: "list[BaseAtomicModel]",
+        has: "Callable[[BaseAtomicModel], bool]",
+        get: "Callable[[BaseAtomicModel], Any]",
+    ) -> "tuple[bool, Any]":
+        """Shared default of the ACTIVE children, or none if they disagree.
+
+        The composition exposes ONE external tensor to all children, so a
+        parent default is only meaningful when every active consumer would
+        have used the same value anyway. Otherwise omitting the input must
+        stay omitted, letting each child apply its own default, rather than
+        silently broadcasting one child's value to the others.
+
+        Children that do not consume the input (dimension 0, e.g. an
+        analytical bridging term) are excluded by the caller, so a learned
+        model composed with ZBL still inherits the learned default.
+        """
+        if not actives or not all(has(m) for m in actives):
+            return False, None
+        values = [np.asarray(get(m), dtype=float).reshape(-1) for m in actives]
+        first = values[0]
+        if any(v.shape != first.shape or not np.allclose(v, first) for v in values[1:]):
+            return False, None
+        return True, get(actives[0])
+
+    def _chg_spin_consumers(self) -> list:
+        """Children that actually consume ``charge_spin``."""
+        return [m for m in self.models if m.get_dim_chg_spin() > 0]
+
+    def _fparam_consumers(self) -> list:
+        """Children that actually consume ``fparam``."""
+        return [m for m in self.models if m.get_dim_fparam() > 0]
+
+    def get_default_chg_spin(self) -> "Array | None":
+        """The shared default charge/spin conditions, if the children agree."""
+        return self._agreed_default(
+            self._chg_spin_consumers(),
+            lambda m: m.get_default_chg_spin() is not None,
+            lambda m: m.get_default_chg_spin(),
+        )[1]
+
+    def has_default_fparam(self) -> bool:
+        """Whether every active child shares one default frame parameter."""
+        return self._agreed_default(
+            self._fparam_consumers(),
+            lambda m: m.has_default_fparam(),
+            lambda m: m.get_default_fparam(),
+        )[0]
+
+    def get_default_fparam(self) -> "list[float] | None":
+        """The shared default frame parameters, if the children agree."""
+        return self._agreed_default(
+            self._fparam_consumers(),
+            lambda m: m.has_default_fparam(),
+            lambda m: m.get_default_fparam(),
+        )[1]
+
+    def get_sel_type(self) -> list[int]:
+        """Get the selected atom types of this model.
+
+        Only atoms with selected atom types have atomic contribution
+        to the result of the model.
+        If returning an empty list, all atom types are selected.
+        """
+        if any(model.get_sel_type() == [] for model in self.models):
+            return []
+        # join all the selected types
+        return list(set().union(*[model.get_sel_type() for model in self.models]))
+
+    def is_aparam_nall(self) -> bool:
+        """Check whether the shape of atomic parameters is (nframes, nall, ndim).
+
+        If False, the shape is (nframes, nloc, ndim).
+        """
+        return False
+
+
+@BaseAtomicModel.register("zbl")
+class DPZBLLinearEnergyAtomicModel(LinearEnergyAtomicModel):
+    """Model linearly combine a list of AtomicModels.
+
+    Parameters
+    ----------
+    dp_model
+        The DPAtomicModel being combined.
+    zbl_model
+        The PairTable model being combined.
+    sw_rmin
+        The lower boundary of the interpolation between short-range tabulated interaction and DP.
+    sw_rmax
+        The upper boundary of the interpolation between short-range tabulated interaction and DP.
+    type_map
+        Mapping atom type to the name (str) of the type.
+        For example `type_map[1]` gives the name of the type 1.
+    smin_alpha
+        The short-range tabulated interaction will be switched according to the distance of the nearest neighbor.
+        This distance is calculated by softmin.
+    """
+
+    def __init__(
+        self,
+        dp_model: DPAtomicModel,
+        zbl_model: PairTabAtomicModel,
+        sw_rmin: float,
+        sw_rmax: float,
+        type_map: list[str],
+        smin_alpha: float | None = 0.1,
+        **kwargs: Any,
+    ) -> None:
+        models = [dp_model, zbl_model]
+        kwargs["models"] = models
+        kwargs["type_map"] = type_map
+        super().__init__(**kwargs)
+
+        self.sw_rmin = sw_rmin
+        self.sw_rmax = sw_rmax
+        self.smin_alpha = smin_alpha
+
+    def serialize(self) -> dict:
+        dd = super().serialize()
+        dd.update(
+            {
+                "@class": "Model",
+                "@version": 2,
+                "type": "zbl",
+                "sw_rmin": self.sw_rmin,
+                "sw_rmax": self.sw_rmax,
+                "smin_alpha": self.smin_alpha,
+            }
+        )
+        return dd
+
+    @classmethod
+    def deserialize(cls, data: Any) -> "DPZBLLinearEnergyAtomicModel":
+        data = data.copy()
+        check_version_compatibility(data.pop("@version", 1), 2, 2)
+        models = [
+            BaseAtomicModel.get_class_by_type(model["type"]).deserialize(model)
+            for model in data["models"]
+        ]
+        data["dp_model"], data["zbl_model"] = models[0], models[1]
+        data.pop("@class", None)
+        data.pop("type", None)
+        return super().deserialize(data)
+
+    def set_case_embd(self, case_idx: int) -> None:
+        """
+        Set the case embedding of this atomic model by the given case_idx,
+        typically concatenated with the output of the descriptor and fed into the fitting net.
+        """
+        # only set case_idx for dpmodel
+        self.models[0].set_case_embd(case_idx)
+
+    def _compute_weight(
+        self,
+        extended_coord: Array,
+        extended_atype: Array,
+        nlists_: list[Array],
+    ) -> list[Array]:
+        """ZBL weight.
+
+        Returns
+        -------
+        list[Array]
+            the atomic ZBL weight for interpolation. (nframes, nloc, 1)
+        """
+        assert self.sw_rmax > self.sw_rmin, (
+            "The upper boundary `sw_rmax` must be greater than the lower boundary `sw_rmin`."
+        )
+
+        xp = array_api_compat.array_namespace(extended_coord, extended_atype)
+        dp_nlist = nlists_[0]
+        zbl_nlist = nlists_[1]
+
+        zbl_nnei = zbl_nlist.shape[-1]
+        dp_nnei = dp_nlist.shape[-1]
+
+        # use the larger rr based on nlist
+        nlist_larger = zbl_nlist if zbl_nnei >= dp_nnei else dp_nlist
+        masked_nlist = xp.clip(nlist_larger, 0, None)
+        pairwise_rr = PairTabAtomicModel._get_pairwise_dist(
+            extended_coord, masked_nlist
+        )
+
+        numerator = xp.sum(
+            xp.where(
+                nlist_larger != -1,
+                pairwise_rr * xp.exp(-pairwise_rr / self.smin_alpha),
+                xp.zeros_like(nlist_larger),
+            ),
+            axis=-1,
+        )  # masked nnei will be zero, no need to handle
+        denominator = xp.sum(
+            xp.where(
+                nlist_larger != -1,
+                xp.exp(-pairwise_rr / self.smin_alpha),
+                xp.zeros_like(nlist_larger),
+            ),
+            axis=-1,
+        )  # handle masked nnei.
+        with np.errstate(divide="ignore", invalid="ignore"):
+            sigma = numerator / denominator
+        u = (sigma - self.sw_rmin) / (self.sw_rmax - self.sw_rmin)
+        coef = xp.zeros_like(u)
+        left_mask = sigma < self.sw_rmin
+        mid_mask = (self.sw_rmin <= sigma) & (sigma < self.sw_rmax)
+        right_mask = sigma >= self.sw_rmax
+        coef = xp.where(left_mask, xp.ones_like(coef), coef)
+        with np.errstate(invalid="ignore"):
+            smooth = -6 * u**5 + 15 * u**4 - 10 * u**3 + 1
+        coef = xp.where(mid_mask, smooth, coef)
+        coef = xp.where(right_mask, xp.zeros_like(coef), coef)
+        # to handle masked atoms
+        coef = xp.where(sigma != 0, coef, xp.zeros_like(coef))
+        self.zbl_weight = coef
+        return [1 - xp.expand_dims(coef, axis=-1), xp.expand_dims(coef, axis=-1)]

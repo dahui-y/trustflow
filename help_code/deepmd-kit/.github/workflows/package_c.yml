@@ -1,0 +1,110 @@
+name: Build C library
+
+on:
+  push:
+    branches-ignore:
+      - "gh-readonly-queue/**"
+      - "copilot/**"
+      - "dependabot/**"
+      - "pre-commit-ci-update-config"
+    tags:
+      - "v*"
+  pull_request:
+  merge_group:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref || github.run_id }}
+  cancel-in-progress: true
+jobs:
+  build_c:
+    name: Build C library
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        include:
+          - package_c_runtime_dependency_pre_exclude_regexes: 'libtorch.*\.so.*;libc10.*\.so.*;libshm\.so.*;libkineto\.so.*;libbackend_with_compiler\.so.*;libcaffe2.*\.so.*;libcuda.*\.so.*;libcudart.*\.so.*;libcublas.*\.so.*;libcufft.*\.so.*;libcufile.*\.so.*;libcupti.*\.so.*;libcurand.*\.so.*;libcusolver.*\.so.*;libcusparse.*\.so.*;libnv.*\.so.*;libcudnn.*\.so.*;libnccl.*\.so.*'
+            package_c_runtime_dependency_post_exclude_regexes: '.*/libtorch.*\.so.*;.*/libc10.*\.so.*;.*/libshm\.so.*;.*/libkineto\.so.*;.*/libbackend_with_compiler\.so.*;.*/libcaffe2.*\.so.*;.*/libcuda.*\.so.*;.*/libcudart.*\.so.*;.*/libcublas.*\.so.*;.*/libcufft.*\.so.*;.*/libcufile.*\.so.*;.*/libcupti.*\.so.*;.*/libcurand.*\.so.*;.*/libcusolver.*\.so.*;.*/libcusparse.*\.so.*;.*/libnv.*\.so.*;.*/libcudnn.*\.so.*;.*/libnccl.*\.so.*'
+            filename: libdeepmd_c.tar.gz
+    steps:
+      - name: Free Disk Space (Ubuntu)
+        uses: insightsengineering/disk-space-reclaimer@v1
+        with:
+          tools-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
+          docker-images: true
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Package C library
+        run: ./source/install/docker_package_c.sh
+        env:
+          ENABLE_PYTORCH: "TRUE"
+          PACKAGE_C_RUNTIME_DEPENDENCY_PRE_EXCLUDE_REGEXES: ${{ matrix.package_c_runtime_dependency_pre_exclude_regexes }}
+          PACKAGE_C_RUNTIME_DEPENDENCY_POST_EXCLUDE_REGEXES: ${{ matrix.package_c_runtime_dependency_post_exclude_regexes }}
+      - name: Check C library package contents
+        run: |
+          tar -tzf libdeepmd_c.tar.gz | tee libdeepmd_c.contents
+          grep -q 'libdeepmd_c/lib/libdeepmd_backend_tf.so' libdeepmd_c.contents
+          grep -q 'libdeepmd_c/lib/libdeepmd_backend_pt.so' libdeepmd_c.contents
+          grep -q 'libdeepmd_c/lib/libdeepmd_backend_ptexpt.so' libdeepmd_c.contents
+          grep -q 'libdeepmd_c/lib/libdeepmd_op_pt.so' libdeepmd_c.contents
+          grep -q 'libdeepmd_c/download_libtorch.sh' libdeepmd_c.contents
+          if grep -E 'libdeepmd_c/lib/(libtorch|libc10|libshm|libkineto|libbackend_with_compiler|libcaffe2|libcuda|libcudart|libcublas|libcufft|libcufile|libcupti|libcurand|libcusolver|libcusparse|libnv|libcudnn|libnccl)' libdeepmd_c.contents; then
+            echo "PyTorch/CUDA runtime libraries must not be bundled in libdeepmd_c.tar.gz"
+            exit 1
+          fi
+      - name: Note external PyTorch runtime
+        run: |
+          libtorch_url=$(tar -xOf libdeepmd_c.tar.gz libdeepmd_c/download_libtorch.sh | sed -n 's/^LIBTORCH_DOWNLOAD_URL="\(.*\)"$/\1/p')
+          {
+            echo "PyTorch support was built into the C package, but PyTorch runtime libraries are not bundled."
+            echo "Download matching libtorch from: ${libtorch_url}"
+            echo "Or run ./download_libtorch.sh after extracting libdeepmd_c.tar.gz."
+            echo "The PyTorch version must match the build version exactly; the CUDA variant may be omitted only when compatible."
+          } >> "$GITHUB_STEP_SUMMARY"
+      - run: cp libdeepmd_c.tar.gz ${{ matrix.filename }}
+        if: matrix.filename != 'libdeepmd_c.tar.gz'
+      # for download and debug
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: libdeepmd_c-${{ strategy.job-index }}-${{ matrix.filename }}
+          path: ${{ matrix.filename }}
+      - name: Test C library
+        run: ./source/install/docker_test_package_c.sh
+        env:
+          CHECK_PYTORCH_RUNTIME: "1"
+      - name: Release
+        uses: softprops/action-gh-release@v3
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: ${{ matrix.filename }}
+  test_c:
+    name: Test building from C library
+    needs: [build_c]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Download artifact
+        uses: actions/download-artifact@v8
+        with:
+          pattern: libdeepmd_c-*
+          merge-multiple: true
+      - run: tar -vxzf ./libdeepmd_c.tar.gz
+      - name: Test C library
+        run: ./source/install/build_from_c.sh
+        env:
+          DEEPMD_C_ROOT: ${{ github.workspace }}/libdeepmd_c
+  pass:
+    name: Pass building c library
+    needs: [build_c, test_c]
+    runs-on: ubuntu-slim
+    if: always()
+    steps:
+      - name: Decide whether the needed jobs succeeded or failed
+        uses: re-actors/alls-green@release/v1
+        with:
+          jobs: ${{ toJSON(needs) }}

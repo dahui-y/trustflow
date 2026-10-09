@@ -1,0 +1,417 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
+#pragma once
+
+#include <tensorflow/c/c_api.h>
+#include <tensorflow/c/eager/c_api.h>
+
+#include "DeepPot.h"
+#include "common.h"
+#include "neighbor_list.h"
+
+namespace deepmd {
+/**
+ * @brief TensorFlow implementation for Deep Potential.
+ **/
+class DeepPotJAX : public DeepPotBackend {
+ public:
+  /**
+   * @brief DP constructor without initialization.
+   **/
+  DeepPotJAX();
+  virtual ~DeepPotJAX();
+  /**
+   * @brief DP constructor with initialization.
+   * @param[in] model The name of the frozen model file.
+   * @param[in] gpu_rank The GPU rank. Default is 0. If < 0, use CPU.
+   * @param[in] file_content The content of the model file. If it is not empty,
+   *DP will read from the string instead of the file.
+   **/
+  DeepPotJAX(const std::string& model,
+             const int& gpu_rank = 0,
+             const std::string& file_content = "");
+  /**
+   * @brief Initialize the DP.
+   * @param[in] model The name of the frozen model file.
+   * @param[in] gpu_rank The GPU rank. Default is 0. If < 0, use CPU.
+   * @param[in] file_content The content of the model file. If it is not empty,
+   *DP will read from the string instead of the file.
+   **/
+  void init(const std::string& model,
+            const int& gpu_rank = 0,
+            const std::string& file_content = "");
+  /**
+   * @brief Get the cutoff radius.
+   * @return The cutoff radius.
+   **/
+  double cutoff() const {
+    assert(inited);
+    return rcut;
+  };
+  /**
+   * @brief Get the number of types.
+   * @return The number of types.
+   **/
+  int numb_types() const {
+    assert(inited);
+    return ntypes;
+  };
+  /**
+   * @brief Get the number of types with spin.
+   * @return The number of types with spin.
+   **/
+  int numb_types_spin() const {
+    assert(inited);
+    return 0;
+  };
+  /**
+   * @brief Get the dimension of the frame parameter.
+   * @return The dimension of the frame parameter.
+   **/
+  int dim_fparam() const {
+    assert(inited);
+    return dfparam;
+  };
+  /**
+   * @brief Get the dimension of the atomic parameter.
+   * @return The dimension of the atomic parameter.
+   **/
+  int dim_aparam() const {
+    assert(inited);
+    return daparam;
+  };
+  /**
+   * @brief Get the type map (element name of the atom types) of this model.
+   * @param[out] type_map The type map of this model.
+   **/
+  void get_type_map(std::string& type_map);
+
+  /**
+   * @brief Get whether the atom dimension of aparam is nall instead of fparam.
+   * @param[out] aparam_nall whether the atom dimension of aparam is nall
+   *instead of fparam.
+   **/
+  bool is_aparam_nall() const {
+    assert(inited);
+    return false;
+  };
+  /**
+   * @brief Check if the model has default frame parameters.
+   * @return true if the model has default frame parameters.
+   **/
+  bool has_default_fparam() const {
+    assert(inited);
+    return has_default_fparam_;
+  };
+  /**
+   * @brief Get dimension of charge/spin condition inputs.
+   * @return The dimension of charge/spin condition inputs.
+   **/
+  int dim_chg_spin() const override {
+    assert(inited);
+    return dchgspin;
+  };
+  /**
+   * @brief Fix the charge/spin condition served when a call names none.
+   *
+   * This backend reads the condition as an ordinary per-call input and falls
+   * back to the state loaded from the model whenever a call omits it, so
+   * installing a new state means replacing that fallback. Without this the
+   * inherited no-op would report success while every later evaluation kept
+   * using the model's own default.
+   *
+   * @param[in] charge_spin The condition, of length ``dim_chg_spin()``.
+   **/
+  void set_charge_spin(const std::vector<double>& charge_spin) override {
+    assert(inited);
+    if (dchgspin == 0) {
+      throw deepmd::deepmd_exception(
+          "this model does not support a charge/spin condition");
+    }
+    if (static_cast<int>(charge_spin.size()) != dchgspin) {
+      throw deepmd::deepmd_exception("the charge/spin condition carries " +
+                                     std::to_string(charge_spin.size()) +
+                                     " values but the model expects " +
+                                     std::to_string(dchgspin));
+    }
+    require_addressable_charge_spin(charge_spin);
+    default_chg_spin_ = charge_spin;
+    has_default_chg_spin_ = true;
+  };
+
+  // forward to template class
+  void computew(std::vector<double>& ener,
+                std::vector<double>& force,
+                std::vector<double>& virial,
+                std::vector<double>& atom_energy,
+                std::vector<double>& atom_virial,
+                const std::vector<double>& coord,
+                const std::vector<int>& atype,
+                const std::vector<double>& box,
+                const std::vector<double>& fparam,
+                const std::vector<double>& aparam,
+                const bool atomic);
+  void computew(std::vector<double>& ener,
+                std::vector<double>& force,
+                std::vector<double>& virial,
+                std::vector<double>& atom_energy,
+                std::vector<double>& atom_virial,
+                const std::vector<double>& coord,
+                const std::vector<int>& atype,
+                const std::vector<double>& box,
+                const std::vector<double>& fparam,
+                const std::vector<double>& aparam,
+                const std::vector<double>& charge_spin,
+                const bool atomic) override;
+  void computew(std::vector<double>& ener,
+                std::vector<float>& force,
+                std::vector<float>& virial,
+                std::vector<float>& atom_energy,
+                std::vector<float>& atom_virial,
+                const std::vector<float>& coord,
+                const std::vector<int>& atype,
+                const std::vector<float>& box,
+                const std::vector<float>& fparam,
+                const std::vector<float>& aparam,
+                const bool atomic);
+  void computew(std::vector<double>& ener,
+                std::vector<float>& force,
+                std::vector<float>& virial,
+                std::vector<float>& atom_energy,
+                std::vector<float>& atom_virial,
+                const std::vector<float>& coord,
+                const std::vector<int>& atype,
+                const std::vector<float>& box,
+                const std::vector<float>& fparam,
+                const std::vector<float>& aparam,
+                const std::vector<double>& charge_spin,
+                const bool atomic) override;
+  void computew(std::vector<double>& ener,
+                std::vector<double>& force,
+                std::vector<double>& virial,
+                std::vector<double>& atom_energy,
+                std::vector<double>& atom_virial,
+                const std::vector<double>& coord,
+                const std::vector<int>& atype,
+                const std::vector<double>& box,
+                const int nghost,
+                const InputNlist& inlist,
+                const int& ago,
+                const std::vector<double>& fparam,
+                const std::vector<double>& aparam,
+                const bool atomic);
+  void computew(std::vector<double>& ener,
+                std::vector<double>& force,
+                std::vector<double>& virial,
+                std::vector<double>& atom_energy,
+                std::vector<double>& atom_virial,
+                const std::vector<double>& coord,
+                const std::vector<int>& atype,
+                const std::vector<double>& box,
+                const int nghost,
+                const InputNlist& inlist,
+                const int& ago,
+                const std::vector<double>& fparam,
+                const std::vector<double>& aparam,
+                const std::vector<double>& charge_spin,
+                const bool atomic) override;
+  void computew(std::vector<double>& ener,
+                std::vector<float>& force,
+                std::vector<float>& virial,
+                std::vector<float>& atom_energy,
+                std::vector<float>& atom_virial,
+                const std::vector<float>& coord,
+                const std::vector<int>& atype,
+                const std::vector<float>& box,
+                const int nghost,
+                const InputNlist& inlist,
+                const int& ago,
+                const std::vector<float>& fparam,
+                const std::vector<float>& aparam,
+                const bool atomic);
+  void computew(std::vector<double>& ener,
+                std::vector<float>& force,
+                std::vector<float>& virial,
+                std::vector<float>& atom_energy,
+                std::vector<float>& atom_virial,
+                const std::vector<float>& coord,
+                const std::vector<int>& atype,
+                const std::vector<float>& box,
+                const int nghost,
+                const InputNlist& inlist,
+                const int& ago,
+                const std::vector<float>& fparam,
+                const std::vector<float>& aparam,
+                const std::vector<double>& charge_spin,
+                const bool atomic) override;
+  void computew_mixed_type(std::vector<double>& ener,
+                           std::vector<double>& force,
+                           std::vector<double>& virial,
+                           std::vector<double>& atom_energy,
+                           std::vector<double>& atom_virial,
+                           const int& nframes,
+                           const std::vector<double>& coord,
+                           const std::vector<int>& atype,
+                           const std::vector<double>& box,
+                           const std::vector<double>& fparam,
+                           const std::vector<double>& aparam,
+                           const bool atomic);
+  void computew_mixed_type(std::vector<double>& ener,
+                           std::vector<float>& force,
+                           std::vector<float>& virial,
+                           std::vector<float>& atom_energy,
+                           std::vector<float>& atom_virial,
+                           const int& nframes,
+                           const std::vector<float>& coord,
+                           const std::vector<int>& atype,
+                           const std::vector<float>& box,
+                           const std::vector<float>& fparam,
+                           const std::vector<float>& aparam,
+                           const bool atomic);
+
+ private:
+  /** Release every TensorFlow C API handle owned by this backend.
+   *
+   * This helper is intentionally safe for partially initialized objects so an
+   * exception from init() cannot leak handles or make a later retry unsafe.
+   */
+  void clear_tf_resources() noexcept;
+
+  bool inited;
+  // device
+  std::string device;
+  // the cutoff radius
+  double rcut;
+  // the number of types
+  int ntypes;
+  // the dimension of the frame parameter
+  int dfparam;
+  // the dimension of the atomic parameter
+  int daparam;
+  // the dimension of charge/spin condition inputs
+  int dchgspin;
+  // has default charge/spin values
+  bool has_default_chg_spin_;
+  // default charge/spin values
+  std::vector<double> default_chg_spin_;
+  // type map
+  std::string type_map;
+  // sel
+  std::vector<int64_t> sel;
+  // number of neighbors
+  int nnei;
+  // do message passing
+  bool do_message_passing;
+  // has default fparam
+  bool has_default_fparam_;
+  // Frame parameters embedded in the exported model. The JAX SavedModel
+  // signatures require a concrete tensor, so the C++ API materializes these
+  // values when callers omit fparam.
+  std::vector<double> default_fparam_;
+  // Model-level pair-exclusion keep table (flat (ntypes+1)^2), built once in
+  // init from the exported ``get_pair_exclude_types``. Empty => no exclusion.
+  // The exported ``call_lower_*`` consumes a pre-excluded nlist (decision
+  // #18/A4), so this ingestion seam folds exclusion into the LAMMPS nlist.
+  std::vector<int> pair_exclude_table_;
+  // whether SavedModel execution goes through XLA and benefits from shape
+  // padding; true for JAX/jax2tf XlaCallModule and TF2 jit_compile exports
+  bool uses_xla_compilation_ = false;
+  // padding to nall
+  int padding_to_nall = 0;
+  // padding for nloc
+  int padding_for_nloc = 0;
+  /**  TF C API objects.
+   * @{
+   */
+  TF_Graph* graph = nullptr;
+  TF_Status* status = nullptr;
+  TF_Session* session = nullptr;
+  TF_SessionOptions* sessionopts = nullptr;
+  TFE_ContextOptions* ctx_opts = nullptr;
+  TFE_Context* ctx = nullptr;
+  std::vector<TF_Function*> func_vector;
+  /**
+   * @}
+   */
+  // neighbor list data
+  NeighborListData nlist_data;
+  /**
+   * @brief Evaluate the energy, force, virial, atomic energy, and atomic virial
+   *by using this DP.
+   * @param[out] ener The system energy.
+   * @param[out] force The force on each atom.
+   * @param[out] virial The virial.
+   * @param[out] atom_energy The atomic energy.
+   * @param[out] atom_virial The atomic virial.
+   * @param[in] coord The coordinates of atoms. The array should be of size
+   *nframes x natoms x 3.
+   * @param[in] atype The atom types. The list should contain natoms ints.
+   * @param[in] box The cell of the region. The array should be of size nframes
+   *x 9.
+   * @param[in] fparam The frame parameter. The array can be of size :
+   * nframes x dim_fparam.
+   * dim_fparam. Then all frames are assumed to be provided with the same
+   *fparam.
+   * @param[in] aparam The atomic parameter The array can be of size :
+   * nframes x natoms x dim_aparam.
+   * natoms x dim_aparam. Then all frames are assumed to be provided with the
+   *same aparam.
+   * @param[in] atomic Whether to compute the atomic energy and virial.
+   **/
+  template <typename VALUETYPE>
+  void compute(std::vector<ENERGYTYPE>& ener,
+               std::vector<VALUETYPE>& force,
+               std::vector<VALUETYPE>& virial,
+               std::vector<VALUETYPE>& atom_energy,
+               std::vector<VALUETYPE>& atom_virial,
+               const std::vector<VALUETYPE>& coord,
+               const std::vector<int>& atype,
+               const std::vector<VALUETYPE>& box,
+               const std::vector<VALUETYPE>& fparam,
+               const std::vector<VALUETYPE>& aparam,
+               const std::vector<double>& charge_spin,
+               const bool atomic);
+
+  /**
+   * @brief Evaluate the energy, force, virial, atomic energy, and atomic virial
+   *by using this DP.
+   * @param[out] ener The system energy.
+   * @param[out] force The force on each atom.
+   * @param[out] virial The virial.
+   * @param[out] atom_energy The atomic energy.
+   * @param[out] atom_virial The atomic virial.
+   * @param[in] coord The coordinates of atoms. The array should be of size
+   *nframes x natoms x 3.
+   * @param[in] atype The atom types. The list should contain natoms ints.
+   * @param[in] box The cell of the region. The array should be of size nframes
+   *x 9.
+   * @param[in] nghost The number of ghost atoms.
+   * @param[in] lmp_list The input neighbour list.
+   * @param[in] ago Update the internal neighbour list if ago is 0.
+   * @param[in] fparam The frame parameter. The array can be of size :
+   * nframes x dim_fparam.
+   * dim_fparam. Then all frames are assumed to be provided with the same
+   *fparam.
+   * @param[in] aparam The atomic parameter The array can be of size :
+   * nframes x natoms x dim_aparam.
+   * natoms x dim_aparam. Then all frames are assumed to be provided with the
+   *same aparam.
+   * @param[in] atomic Whether to compute atomic energy and virial.
+   **/
+  template <typename VALUETYPE>
+  void compute(std::vector<ENERGYTYPE>& ener,
+               std::vector<VALUETYPE>& force,
+               std::vector<VALUETYPE>& virial,
+               std::vector<VALUETYPE>& atom_energy,
+               std::vector<VALUETYPE>& atom_virial,
+               const std::vector<VALUETYPE>& coord,
+               const std::vector<int>& atype,
+               const std::vector<VALUETYPE>& box,
+               const int nghost,
+               const InputNlist& lmp_list,
+               const int& ago,
+               const std::vector<VALUETYPE>& fparam,
+               const std::vector<VALUETYPE>& aparam,
+               const std::vector<double>& charge_spin,
+               const bool atomic);
+};
+}  // namespace deepmd

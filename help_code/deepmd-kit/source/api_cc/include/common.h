@@ -1,0 +1,391 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
+#pragma once
+
+#include <cstdint>
+#include <iostream>
+#include <set>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "AtomMap.h"
+#include "errors.h"
+#include "neighbor_list.h"
+#include "version.h"
+
+namespace deepmd {
+
+typedef double ENERGYTYPE;
+enum DPBackend { TensorFlow, PyTorch, PyTorchExportable, Paddle, JAX, Unknown };
+
+/**
+ * @brief Get the backend of the model.
+ * @param[in] model The model name.
+ * @return The backend of the model.
+ **/
+DPBackend get_backend(const std::string& model);
+
+struct NeighborListData {
+  /// Array stores the core region atom's index
+  std::vector<int> ilist;
+  /// Array stores the core region atom's neighbor index
+  std::vector<std::vector<int>> jlist;
+  /// Array stores the number of neighbors of core region atoms
+  std::vector<int> numneigh;
+  /// Array stores the the location of the first neighbor of core region atoms
+  std::vector<int*> firstneigh;
+
+ public:
+  /**
+   * @brief Copy the neighbor list from an InputNlist.
+   * @param[in] inlist The input neighbor list.
+   * @param[in] natoms The number of atoms to copy. If natoms is -1, copy all
+   * atoms.
+   */
+  void copy_from_nlist(const InputNlist& inlist, const int natoms = -1);
+  void shuffle(const std::vector<int>& fwd_map);
+  void shuffle(const deepmd::AtomMap& map);
+  void shuffle_exclude_empty(const std::vector<int>& fwd_map);
+  void make_inlist(InputNlist& inlist);
+  void padding();
+};
+
+/**
+ * @brief Check if the model version is supported.
+ * @param[in] model_version The model version.
+ * @return Whether the model is supported (true or false).
+ **/
+bool model_compatable(std::string& model_version);
+
+/**
+ * @brief Get forward and backward map of selected atoms by
+ * atom types.
+ * @param[out] fwd_map The forward map with size natoms.
+ * @param[out] bkw_map The backward map with size nreal.
+ * @param[out] nghost_real The number of selected ghost atoms.
+ * @param[in] dcoord_ The coordinates of all atoms. Reserved for compatibility.
+ * @param[in] datype_ The atom types of all atoms.
+ * @param[in] nghost The number of ghost atoms.
+ * @param[in] sel_type_ The selected atom types.
+ */
+template <typename VALUETYPE>
+void select_by_type(std::vector<int>& fwd_map,
+                    std::vector<int>& bkw_map,
+                    int& nghost_real,
+                    const std::vector<VALUETYPE>& dcoord_,
+                    const std::vector<int>& datype_,
+                    const int& nghost,
+                    const std::vector<int>& sel_type_);
+
+template <typename VALUETYPE>
+void select_real_atoms(std::vector<int>& fwd_map,
+                       std::vector<int>& bkw_map,
+                       int& nghost_real,
+                       const std::vector<VALUETYPE>& dcoord_,
+                       const std::vector<int>& datype_,
+                       const int& nghost,
+                       const int& ntypes);
+
+template <typename VALUETYPE>
+void select_real_atoms_coord(std::vector<VALUETYPE>& dcoord,
+                             std::vector<int>& datype,
+                             std::vector<VALUETYPE>& aparam,
+                             int& nghost_real,
+                             std::vector<int>& fwd_map,
+                             std::vector<int>& bkw_map,
+                             int& nall_real,
+                             int& nloc_real,
+                             const std::vector<VALUETYPE>& dcoord_,
+                             const std::vector<int>& datype_,
+                             const std::vector<VALUETYPE>& aparam_,
+                             const int& nghost,
+                             const int& ntypes,
+                             const int& nframes,
+                             const int& daparam,
+                             const int& nall,
+                             const bool aparam_nall = false);
+
+/**
+ * @brief Apply the given map to a vector.
+ * @param[out] out The output vector.
+ * @param[in] in The input vector.
+ * @param[in] fwd_map The map.
+ * @param[in] stride The stride of the input vector.
+ * @param[in] nframes The number of frames.
+ * @param[in] nall1 The number of atoms in the input vector.
+ * @param[in] nall2 The number of atoms in the output vector.
+ */
+template <typename VT>
+void select_map(std::vector<VT>& out,
+                const std::vector<VT>& in,
+                const std::vector<int>& fwd_map,
+                const int& stride,
+                const int& nframes = 1,
+                // nall will not take effect if nframes is 1
+                const int& nall1 = 0,
+                const int& nall2 = 0);
+
+/**
+ * @brief Apply the given map to a vector.
+ * @param[out] out The output vector.
+ * @param[in] in The input vector.
+ * @param[in] fwd_map The map.
+ * @param[in] stride The stride of the input vector.
+ * @param[in] nframes The number of frames.
+ * @param[in] nall1 The number of atoms in the input vector.
+ * @param[in] nall2 The number of atoms in the output vector.
+ */
+template <typename VT>
+void select_map(typename std::vector<VT>::iterator out,
+                const typename std::vector<VT>::const_iterator in,
+                const std::vector<int>& fwd_map,
+                const int& stride,
+                const int& nframes = 1,
+                const int& nall1 = 0,
+                const int& nall2 = 0);
+
+template <typename VT>
+void select_map_inv(std::vector<VT>& out,
+                    const std::vector<VT>& in,
+                    const std::vector<int>& fwd_map,
+                    const int& stride);
+
+template <typename VT>
+void select_map_inv(typename std::vector<VT>::iterator out,
+                    const typename std::vector<VT>::const_iterator in,
+                    const std::vector<int>& fwd_map,
+                    const int& stride);
+
+/**
+ * @brief Remap communication sendlist for message passing with NULL-type atoms.
+ *
+ * When NULL-type (virtual) atoms are present, the original LAMMPS sendlist
+ * contains indices referring to virtual atoms that have been filtered out by
+ * select_real_atoms_coord. This function remaps those indices through fwd_map
+ * and independently recomputes recvnum using firstrecv.
+ *
+ * @param[out] new_sendlist Remapped send lists per swap (vector of vectors).
+ * @param[out] new_sendnum Number of atoms to send per swap after remapping.
+ * @param[out] new_recvnum Number of atoms to receive per swap after remapping.
+ * @param[in] lmp_list The LAMMPS neighbor list containing communication info.
+ * @param[in] fwd_map Forward map from original atom index to real-atom index
+ *            (-1 for virtual/NULL atoms).
+ */
+void remap_comm_sendlist(std::vector<std::vector<int>>& new_sendlist,
+                         std::vector<int>& new_sendnum,
+                         std::vector<int>& new_recvnum,
+                         const InputNlist& lmp_list,
+                         const std::vector<int>& fwd_map);
+
+/**
+ * @brief Pack one communication send-list pointer address per MPI swap.
+ *
+ * The corresponding send counts describe the number of atom indices behind
+ * each pointer; they do not change the length of the pointer-address array.
+ *
+ * @param[in] sendlist Array of send-list pointers indexed by swap.
+ * @param[in] nswap Number of communication swaps.
+ * @return Integer pointer addresses with exactly nswap entries.
+ */
+std::vector<std::intptr_t> pack_comm_sendlist_pointers(int* const* sendlist,
+                                                       int nswap);
+
+/**
+ * @brief Get the number of threads from the environment variable.
+ * @details A warning will be thrown if environment variables are not set.
+ * @param[out] num_intra_nthreads The number of intra threads. Read from
+ *DP_INTRA_OP_PARALLELISM_THREADS.
+ * @param[out] num_inter_nthreads The number of inter threads. Read from
+ *DP_INTER_OP_PARALLELISM_THREADS.
+ **/
+void get_env_nthreads(int& num_intra_nthreads, int& num_inter_nthreads);
+
+/**
+ * @brief Dynamically load OP library. This should be called before loading
+ * graphs.
+ */
+void load_op_library();
+
+/**
+ * @brief Dynamically load the OP library required by a backend.
+ */
+void load_op_library(DPBackend backend);
+
+/** @struct deepmd::deepmd_exception
+ **/
+
+/**
+ * @brief Throw exception if TensorFlow doesn't work.
+ **/
+struct tf_exception : public deepmd::deepmd_exception {
+ public:
+  tf_exception() : deepmd::deepmd_exception("TensorFlow Error!") {};
+  tf_exception(const std::string& msg)
+      : deepmd::deepmd_exception(std::string("TensorFlow Error: ") + msg) {};
+};
+
+std::string name_prefix(const std::string& name_scope);
+
+/**
+ * @brief Read model file to a string.
+ * @param[in] model Path to the model.
+ * @param[out] file_content Content of the model file.
+ **/
+void read_file_to_string(std::string model, std::string& file_content);
+
+/**
+ * @brief Convert pbtxt to pb.
+ * @param[in] fn_pb_txt Filename of the pb txt file.
+ * @param[in] fn_pb Filename of the pb file.
+ **/
+void convert_pbtxt_to_pb(std::string fn_pb_txt, std::string fn_pb);
+
+/**
+ * @brief Print the summary of DeePMD-kit, including the version and the build
+ * information.
+ * @param[in] pre The prefix to each line.
+ */
+void print_summary(const std::string& pre);
+
+/**
+ * @brief Fold back extended-region values to local atoms via scatter-sum.
+ *
+ * Copies local atom values directly, then accumulates ghost atom contributions
+ * onto their mapped local atoms using the mapping array.
+ *
+ * @tparam VT The value type (double or float).
+ * @param[out] out Output vector of size nframes * nloc * ndim.
+ * @param[in] in Input vector of size nframes * nall * ndim (extended region).
+ * @param[in] mapping Mapping from extended index to local index, size nall.
+ * @param[in] nloc Number of local atoms.
+ * @param[in] nall Number of all atoms (local + ghost).
+ * @param[in] ndim Number of dimensions per atom (e.g. 3 for force, 9 for
+ * virial).
+ * @param[in] nframes Number of frames.
+ */
+template <typename VT>
+void fold_back(std::vector<VT>& out,
+               const std::vector<VT>& in,
+               const std::vector<int>& mapping,
+               const int nloc,
+               const int nall,
+               const int ndim,
+               const int nframes = 1) {
+  const ptrdiff_t nloc_ = nloc;
+  const ptrdiff_t nall_ = nall;
+  const ptrdiff_t ndim_ = ndim;
+  out.resize(static_cast<size_t>(nframes) * nloc_ * ndim_);
+  for (ptrdiff_t kk = 0; kk < nframes; ++kk) {
+    std::copy(in.begin() + kk * nall_ * ndim_,
+              in.begin() + kk * nall_ * ndim_ + nloc_ * ndim_,
+              out.begin() + kk * nloc_ * ndim_);
+    for (ptrdiff_t ii = nloc_; ii < nall_; ++ii) {
+      ptrdiff_t out_idx = mapping[ii];
+      for (ptrdiff_t dd = 0; dd < ndim_; ++dd) {
+        out[kk * nloc_ * ndim_ + out_idx * ndim_ + dd] +=
+            in[kk * nall_ * ndim_ + ii * ndim_ + dd];
+      }
+    }
+  }
+}
+
+/**
+ * @brief Build the flat ``(ntypes+1)^2`` pair-type keep table.
+ *
+ * Inference-path mirror of the Python ``PairExcludeMask`` constructor
+ * (``deepmd/dpmodel/utils/exclude_mask.py``).  The table is row-major over
+ * ``[tj][ti]`` (flat index ``tj * (ntypes+1) + ti``); an entry is ``0`` when
+ * the ordered pair ``(ti, tj)`` is excluded and ``1`` otherwise.  Both ``(ti,
+ * tj)`` and ``(tj, ti)`` are inserted into the exclude set, so the table is
+ * symmetric.  Type ``ntypes`` is the reserved virtual-atom row/column.
+ *
+ * Returns an empty vector when ``exclude_types`` is empty, so callers can treat
+ * an empty table as "no exclusion" (identity) just like the Python
+ * ``pair_excl is None`` early-exit.
+ *
+ * This lives in the backend-agnostic ``common.h`` (not ``commonPT.h``) so both
+ * the libtorch apply-helpers (``applyPairExclusion*`` in ``commonPT.h``) and
+ * the torch-free TF-C-API ``DeepPotJAX`` ingestion seam share one canonical
+ * table builder.
+ *
+ * @param ntypes Number of real atom types.
+ * @param exclude_types List of excluded ``(ti, tj)`` type pairs.
+ */
+inline std::vector<int> buildPairExcludeTable(
+    const int ntypes, const std::vector<std::pair<int, int>>& exclude_types) {
+  if (exclude_types.empty()) {
+    return {};
+  }
+  const int n1 = ntypes + 1;
+  std::set<std::pair<int, int>> excl;
+  for (const auto& tt : exclude_types) {
+    excl.insert({tt.first, tt.second});
+    excl.insert({tt.second, tt.first});
+  }
+  // type_mask[tj][ti] == 0 iff (ti, tj) is excluded (mirrors the Python
+  // list comprehension in PairExcludeMask.__init__, reshape(-1)).
+  std::vector<int> type_mask(static_cast<size_t>(n1) * n1, 1);
+  for (int tj = 0; tj < n1; ++tj) {
+    for (int ti = 0; ti < n1; ++ti) {
+      if (excl.count({ti, tj})) {
+        type_mask[static_cast<size_t>(tj) * n1 + ti] = 0;
+      }
+    }
+  }
+  return type_mask;
+}
+
+/**
+ * @brief Dense-nlist pair-type exclusion on a plain flat ``int64`` neighbour
+ *        list: erase excluded-type neighbours to ``-1`` in place.
+ *
+ * Torch-free twin of ``applyPairExclusionNlist`` (``commonPT.h``, which works
+ * on
+ * ``torch::Tensor``); used by the TF-C-API ``DeepPotJAX`` ingestion seam, which
+ * cannot depend on libtorch.  Same keep-table convention as
+ * ``buildPairExcludeTable`` / ``applyPairExclusionNlist``: keep index
+ * ``center_type * (ntypes+1) + neighbour_type``.  An empty ``type_mask_table``
+ * is identity (no-op), mirroring the ``pair_excl is None`` early-exit.
+ *
+ * Exclusion is a BUILD-time transform (decision #18/A4): the exported
+ * ``call_lower_*`` consumes a pre-excluded nlist and never re-applies it, so
+ * this is the single application site for the JAX/tf2 SavedModel LAMMPS path.
+ *
+ * @param nlist Flat ``nloc * max_size`` neighbour list (extended-space indices;
+ *   ``-1`` == empty slot), modified in place.
+ * @param atype Extended atom types; ``atype[i] >= 0`` for real atoms.  Indexed
+ *   by the centre id ``ii < nloc`` and by each neighbour id in ``nlist``.
+ * @param type_mask_table Flat ``(ntypes+1)^2`` keep table from
+ *   ``buildPairExcludeTable``.  Empty => identity.
+ * @param ntypes Number of real atom types.
+ * @param nloc Number of local (centre) atoms.
+ * @param max_size Neighbours per centre (row stride of ``nlist``).
+ */
+inline void applyPairExcludeNlistVec(std::vector<std::int64_t>& nlist,
+                                     const std::vector<int>& atype,
+                                     const std::vector<int>& type_mask_table,
+                                     const int ntypes,
+                                     const int nloc,
+                                     const int max_size) {
+  if (type_mask_table.empty()) {
+    return;
+  }
+  const int n1 = ntypes + 1;
+  for (int ii = 0; ii < nloc; ++ii) {
+    const int ti = atype[ii];  // centre type
+    for (int jj = 0; jj < max_size; ++jj) {
+      const std::int64_t nb = nlist[static_cast<size_t>(ii) * max_size + jj];
+      if (nb < 0) {
+        continue;  // empty slot
+      }
+      const int tj = atype[static_cast<size_t>(nb)];  // neighbour type
+      if (tj < 0) {
+        continue;  // padding atom; nothing to exclude
+      }
+      if (type_mask_table[static_cast<size_t>(ti) * n1 + tj] == 0) {
+        nlist[static_cast<size_t>(ii) * max_size + jj] = -1;
+      }
+    }
+  }
+}
+}  // namespace deepmd

@@ -1,0 +1,2613 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
+import functools
+import json
+import logging
+import time
+from collections.abc import (
+    Callable,
+    Generator,
+    Iterable,
+    Mapping,
+)
+from contextlib import (
+    nullcontext,
+)
+from copy import (
+    deepcopy,
+)
+from pathlib import (
+    Path,
+)
+from typing import (
+    Any,
+)
+
+import numpy as np
+import torch
+
+from deepmd.dpmodel.train import (
+    DEFAULT_TASK_KEY,
+    CheckpointStore,
+    ShardingPolicy,
+    TrainingMetricAccumulator,
+    TrainingTimer,
+    build_checkpoint_stores,
+    change_model_out_bias,
+    resolve_step_schedule,
+)
+from deepmd.dpmodel.utils import (
+    compute_total_numb_batch,
+)
+from deepmd.loggers import (
+    is_node_main_process,
+)
+from deepmd.loggers.training import (
+    format_training_message,
+    format_training_message_per_task,
+    log_parameter_counts,
+)
+from deepmd.pt.loss import (
+    DeNSLoss,
+    DOSLoss,
+    EnergySpinLoss,
+    EnergyStdLoss,
+    PopulationLoss,
+    PropertyLoss,
+    TaskLoss,
+    TensorLoss,
+)
+from deepmd.pt.model.descriptor.sezm_nn import (
+    apply_lora_to_sezm,
+    build_merged_state_dict,
+    strip_lora_from_extra_state,
+)
+from deepmd.pt.model.model import (
+    get_model,
+    get_zbl_model,
+)
+from deepmd.pt.model.model.sezm_model import (
+    SeZMModel,
+)
+from deepmd.pt.optimizer import (
+    AdaMuonOptimizer,
+    HybridMuonOptimizer,
+    KFOptimizerWrapper,
+    LKFOptimizer,
+)
+from deepmd.pt.optimizer.hybrid_muon import (
+    adam_route_patterns,
+)
+from deepmd.pt.train.wrapper import (
+    ModelWrapper,
+)
+from deepmd.pt.utils import (
+    dp_random,
+)
+from deepmd.pt.utils.dataloader import (
+    DpLoaderSet,
+    get_sampler_from_params,
+)
+from deepmd.pt.utils.env import (
+    DEVICE,
+    JIT,
+    LOCAL_RANK,
+    NUM_WORKERS,
+    SAMPLER_RECORD,
+)
+from deepmd.pt.utils.learning_rate import (
+    BaseLR,
+)
+from deepmd.pt.utils.lmdb_dataset import (
+    LmdbBatchDataLoader,
+    LmdbDataset,
+)
+from deepmd.pt.utils.stat import (
+    make_stat_input,
+    min_pair_dist_frame_mask,
+    scan_redu_stats,
+    select_batch_frames,
+)
+from deepmd.pt.utils.utils import (
+    to_numpy_array,
+)
+from deepmd.pt_expt.train.ema import (
+    EMA_CHECKPOINT_KEY,
+    ModelEMA,
+    get_ema_checkpoint_prefix,
+)
+from deepmd.pt_expt.train.gradient import (
+    NonFiniteGradGuard,
+    clip_grad_norm_,
+)
+from deepmd.pt_expt.train.utils import (
+    count_parameters,
+    infer_env_defaults,
+    resolve_best_checkpoint_dir,
+    scoped_env_defaults,
+)
+from deepmd.pt_expt.train.validation import (
+    FullValidator,
+    build_full_validators,
+)
+from deepmd.utils.data import (
+    DataRequirementItem,
+    has_data_requirement,
+)
+from deepmd.utils.finetune import (
+    warn_configuration_mismatch_during_finetune,
+)
+from deepmd.utils.out_stat import (
+    ReduStatScanner,
+)
+
+if torch.__version__.startswith("2"):
+    import torch._dynamo
+
+import torch.distributed as dist
+from torch.distributed.checkpoint.state_dict import (
+    StateDictOptions,
+    get_model_state_dict,
+    get_optimizer_state_dict,
+    set_optimizer_state_dict,
+)
+
+try:
+    from torch.distributed.fsdp import (
+        fully_shard,
+    )
+except ImportError:
+    fully_shard = None  # type: ignore[assignment]
+from torch.distributed.optim import (
+    ZeroRedundancyOptimizer,
+)
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import (
+    DataLoader,
+)
+
+from deepmd.utils.stat_file import (
+    StatFileSpec,
+    open_stat_file,
+    run_stat_on_chief,
+    stat_file_specs_by_task,
+)
+
+log = logging.getLogger(__name__)
+
+
+class Trainer:
+    def __init__(
+        self,
+        config: dict[str, Any],
+        training_data: DpLoaderSet,
+        stat_file_spec: StatFileSpec | Mapping[str, StatFileSpec] | None = None,
+        validation_data: DpLoaderSet | None = None,
+        init_model: str | None = None,
+        restart_model: str | None = None,
+        finetune_model: str | None = None,
+        force_load: bool = False,
+        shared_links: dict[str, str] | None = None,
+        finetune_links: dict[str, str] | None = None,
+        init_frz_model: str | None = None,
+    ) -> None:
+        """Construct a DeePMD trainer.
+
+        Args:
+        - config: The Dict-like configuration with training options.
+        """
+        if init_model is not None:
+            resume_model = init_model
+        elif restart_model is not None:
+            resume_model = restart_model
+        elif finetune_model is not None:
+            resume_model = finetune_model
+        else:
+            resume_model = None
+        resuming = resume_model is not None
+        has_initial_state = resuming or init_frz_model is not None
+        self.restart_training = restart_model is not None
+        model_params = config["model"]
+        training_params = config["training"]
+        optimizer_params = config.get("optimizer", {})
+
+        validating_params = config.get("validating") or {}
+        eval_env_defaults = infer_env_defaults(validating_params)
+        self.multi_task = "model_dict" in model_params
+        self.finetune_links = finetune_links
+        finetune_updates_statistics = finetune_links is not None and any(
+            rule.get_has_new_type() for rule in finetune_links.values()
+        )
+        self.model_keys = (
+            list(model_params["model_dict"]) if self.multi_task else ["Default"]
+        )
+        self.is_distributed = dist.is_available() and dist.is_initialized()
+        self.rank = dist.get_rank() if self.is_distributed else 0
+        self.world_size = dist.get_world_size() if self.is_distributed else 1
+        self.num_model = len(self.model_keys)
+        self.stat_file_specs = stat_file_specs_by_task(
+            stat_file_spec,
+            self.model_keys,
+        )
+
+        # Iteration config
+        self.disp_file = training_params.get("disp_file", "lcurve.out")
+        self.disp_freq = training_params.get("disp_freq", 1000)
+        self.disp_avg = training_params.get("disp_avg", False)
+        self.metric_accumulator: TrainingMetricAccumulator | None = None
+        self.save_ckpt = training_params.get("save_ckpt", "model.ckpt")
+        self.save_freq = training_params.get("save_freq", 1000)
+        self.enable_ema = bool(training_params.get("enable_ema", False))
+        self.ema_decay = float(training_params.get("ema_decay", 0.999))
+        self.ema_save_ckpt = get_ema_checkpoint_prefix(self.save_ckpt)
+        self.display_in_training = training_params.get("disp_training", True)
+        self.timing_in_training = training_params.get("time_training", True)
+        self.change_bias_after_training = training_params.get(
+            "change_bias_after_training", False
+        )
+        self.sharding = ShardingPolicy.from_training_params(
+            training_params, is_distributed=self.is_distributed
+        )
+        if self.enable_ema and self.sharding.shards_parameters:
+            raise ValueError(
+                "training.enable_ema currently only supports training.zero_stage < 2."
+            )
+        if self.sharding.enabled and self.change_bias_after_training:
+            raise ValueError(
+                "training.zero_stage does not support change_bias_after_training."
+            )
+        self.lcurve_should_print_header = True
+
+        def get_opt_param(params: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+            """
+            Extract optimizer parameters.
+
+            Note: Default values are already filled by argcheck.normalize()
+            before this function is called.
+            """
+            opt_type = params.get("type", "Adam")
+            if opt_type not in ("Adam", "AdamW", "LKF", "AdaMuon", "HybridMuon"):
+                raise ValueError(f"Not supported optimizer type '{opt_type}'")
+            opt_param = dict(params)
+            opt_param.pop("type", None)
+            return opt_type, opt_param
+
+        def cycle_iterator(iterable: Iterable) -> Generator[Any, None, None]:
+            """
+            Produces an infinite iterator by repeatedly cycling through the given iterable.
+
+            Args:
+                iterable (Iterable): The iterable to cycle through.
+
+            Yields
+            ------
+            Any: The next item from the iterable, cycling back to the beginning when the end is reached.
+            """
+            while True:
+                with torch.device("cpu"):
+                    it = iter(iterable)
+                yield from it
+
+        def get_data_loader(
+            _training_data: DpLoaderSet | LmdbDataset,
+            _validation_data: DpLoaderSet | LmdbDataset | None,
+            _training_params: dict[str, Any],
+        ) -> tuple[
+            DataLoader | LmdbBatchDataLoader,
+            Generator[Any, None, None],
+            DataLoader | LmdbBatchDataLoader | None,
+            Generator[Any, None, None] | None,
+            int,
+        ]:
+            def get_dataloader_and_iter_lmdb(
+                _data: LmdbDataset,
+            ) -> tuple[LmdbBatchDataLoader, Generator[Any, None, None]]:
+                # The sampler yields one list[int] per batch. Every batch is
+                # homogeneous in label availability; whether it is also
+                # homogeneous in atom count follows from the dataset's
+                # batch_size rule, which the sampler reads off the reader.
+                from deepmd.dpmodel.utils.lmdb_data import (
+                    LmdbBatchSampler,
+                )
+
+                _block_targets = getattr(_data, "_block_targets", None)
+                _sampler_kwargs = {
+                    "shuffle": True,
+                    "seed": _training_params.get("seed"),
+                    "block_targets": _block_targets,
+                }
+
+                if self.world_size > 1:
+                    from deepmd.dpmodel.utils.lmdb_data import (
+                        DistributedLmdbBatchSampler,
+                    )
+
+                    _inner_sampler = DistributedLmdbBatchSampler(
+                        _data._reader,
+                        rank=self.rank,
+                        world_size=self.world_size,
+                        **_sampler_kwargs,
+                    )
+                else:
+                    _inner_sampler = LmdbBatchSampler(
+                        _data._reader,
+                        **_sampler_kwargs,
+                    )
+
+                _dataloader = LmdbBatchDataLoader(
+                    _data,
+                    _inner_sampler,
+                    pin_memory=DEVICE.type != "cpu",
+                )
+                _data_iter = cycle_iterator(_dataloader)
+                return _dataloader, _data_iter
+
+            def get_dataloader_and_iter(
+                _data: DpLoaderSet, _params: dict[str, Any]
+            ) -> tuple[DataLoader, Generator[Any, None, None]]:
+                _sampler = get_sampler_from_params(_data, _params)
+                if _sampler is None:
+                    log.warning(
+                        "Sampler not specified!"
+                    )  # None sampler will lead to a premature stop iteration. Replacement should be True in attribute of the sampler to produce expected number of items in one iteration.
+                _dataloader = DataLoader(
+                    _data,
+                    sampler=_sampler,
+                    batch_size=None,
+                    num_workers=NUM_WORKERS
+                    if dist.is_available()
+                    else 0,  # setting to 0 diverges the behavior of its iterator; should be >=1
+                    drop_last=False,
+                    collate_fn=lambda batch: batch,  # prevent extra conversion
+                    pin_memory=(DEVICE != "cpu"),  # pin memory only if not on CPU
+                )
+                _data_iter = cycle_iterator(_dataloader)
+                return _dataloader, _data_iter
+
+            if isinstance(_training_data, LmdbDataset):
+                training_dataloader, training_data_iter = get_dataloader_and_iter_lmdb(
+                    _training_data
+                )
+            else:
+                training_dataloader, training_data_iter = get_dataloader_and_iter(
+                    _training_data, _training_params["training_data"]
+                )
+
+            if _validation_data is not None:
+                if isinstance(_validation_data, LmdbDataset):
+                    (
+                        validation_dataloader,
+                        validation_data_iter,
+                    ) = get_dataloader_and_iter_lmdb(_validation_data)
+                else:
+                    (
+                        validation_dataloader,
+                        validation_data_iter,
+                    ) = get_dataloader_and_iter(
+                        _validation_data, _training_params["validation_data"]
+                    )
+                valid_numb_batch = _training_params["validation_data"].get(
+                    "numb_btch", 1
+                )
+            else:
+                validation_dataloader = None
+                validation_data_iter = None
+                valid_numb_batch = 1
+            return (
+                training_dataloader,
+                training_data_iter,
+                validation_dataloader,
+                validation_data_iter,
+                valid_numb_batch,
+            )
+
+        def single_model_stat(
+            _model: Any,
+            _data_stat_nbatch: int,
+            _training_data: DpLoaderSet,
+            _stat_file_spec: StatFileSpec,
+            _min_pair_dist: float = 0.0,
+            _data_stat_full: bool = False,
+            finetune_has_new_type: bool = False,
+            preset_observed_type: list[str] | None = None,
+        ) -> Callable[[], Any]:
+            @functools.lru_cache
+            def get_sample() -> Any:
+                sampled = make_stat_input(
+                    _training_data.systems,
+                    _training_data.dataloaders,
+                    _data_stat_nbatch,
+                    min_pair_dist=_min_pair_dist,
+                )
+                return sampled
+
+            if _data_stat_full:
+                # sampling a few batches per system can miss rare elements
+                # entirely; scan every frame for the output statistics instead
+                get_sample.redu_stat_scanner = ReduStatScanner(
+                    lambda ntypes, keys, intensive: scan_redu_stats(
+                        _training_data.dataloaders,
+                        ntypes,
+                        keys,
+                        intensive=intensive,
+                        min_pair_dist=_min_pair_dist,
+                    )
+                )
+
+            if not has_initial_state or finetune_has_new_type:
+
+                def initialize_statistics() -> None:
+                    with open_stat_file(_stat_file_spec) as stat_file_path:
+                        _model.compute_or_load_stat(
+                            sampled_func=get_sample,
+                            stat_file_path=stat_file_path,
+                            preset_observed_type=preset_observed_type,
+                        )
+
+                self._run_stat_on_chief(
+                    initialize_statistics,
+                    operation="statistics initialization",
+                )
+            return get_sample
+
+        def get_lr(lr_params: dict[str, Any]) -> BaseLR:
+            lr_params["num_steps"] = self.num_steps
+            lr_schedule = BaseLR(**lr_params)
+            return lr_schedule
+
+        # Optimizer
+        self.opt_type, self.opt_param = get_opt_param(optimizer_params)
+        if self.sharding.enabled and self.multi_task:
+            raise ValueError(
+                "training.zero_stage is currently only supported in single-task training."
+            )
+        if self.sharding.enabled and self.opt_type == "LKF":
+            raise ValueError("training.zero_stage does not support LKF optimizer.")
+
+        # Loss parameters are also used to select SeZM/DeNS execution modes.
+        loss_params_for_model = None
+        if not self.multi_task:
+            loss_params_for_model = config["loss"]
+        else:
+            loss_params_for_model = {
+                model_key: config["loss_dict"][model_key]
+                for model_key in self.model_keys
+            }
+
+        # Model
+        # SeZMModel samples these eval/inference env vars exactly once inside
+        # __init__; keep config-derived defaults scoped to construction.
+        with scoped_env_defaults(eval_env_defaults):
+            self.model = get_model_for_wrapper(
+                model_params,
+                resuming=resuming,
+            )
+        # SeZM specific process for DeNS training
+        prepare_model_for_loss(self.model, loss_params_for_model)
+
+        # Loss
+        if not self.multi_task:
+            self.loss = get_loss(
+                config["loss"],
+                config["learning_rate"]["start_lr"],
+                len(model_params["type_map"]),
+                self.model,
+            )
+        else:
+            self.loss = {}
+            for model_key in self.model_keys:
+                loss_param = config["loss_dict"][model_key]
+                lr_param = config["learning_rate"]["start_lr"]
+                ntypes = len(model_params["model_dict"][model_key]["type_map"])
+                self.loss[model_key] = get_loss(
+                    loss_param, lr_param, ntypes, self.model[model_key]
+                )
+
+        # Losses own the interpretation of their prefactors. The trainer only
+        # consumes their data contract when selecting expensive model outputs.
+        loss_data_requirements = (
+            {
+                model_key: self.loss[model_key].label_requirement
+                for model_key in self.model_keys
+            }
+            if self.multi_task
+            else self.loss.label_requirement
+        )
+        prepare_model_for_data_requirements(
+            self.model,
+            loss_data_requirements,
+            model_params,
+        )
+
+        # Data
+        if not self.multi_task:
+            # add data requirement for labels
+            data_requirement = self.loss.label_requirement
+            data_requirement += get_additional_data_requirement(self.model)
+            min_pair_dist = float(
+                training_params.get("training_data", {}).get("min_pair_dist", 0.0)
+            )
+            if min_pair_dist > 0.0:
+                data_requirement.append(
+                    DataRequirementItem(
+                        "min_pair_dist",
+                        ndof=1,
+                        atomic=False,
+                        must=False,
+                        high_prec=False,
+                        default=min_pair_dist,
+                        source_policy="derived",
+                    )
+                )
+            training_data.add_data_requirement(data_requirement)
+            if validation_data is not None:
+                validation_data.add_data_requirement(
+                    self.loss.label_requirement
+                    + get_additional_data_requirement(self.model)
+                )
+            # Preload and apply modifiers to all data before computing statistics
+            training_data.preload_and_modify_all_data_torch()
+            if validation_data is not None:
+                validation_data.preload_and_modify_all_data_torch()
+            self.get_sample_func = single_model_stat(
+                self.model,
+                model_params.get("data_stat_nbatch", 10),
+                training_data,
+                self.stat_file_specs["Default"],
+                _min_pair_dist=min_pair_dist,
+                _data_stat_full=model_params.get("data_stat_full", False),
+                finetune_has_new_type=self.finetune_links["Default"].get_has_new_type()
+                if self.finetune_links is not None
+                else False,
+                preset_observed_type=model_params.get("info", {}).get("observed_type"),
+            )
+            # Persist observed_type from stat into model_params and model_def_script
+            if not resuming and self.rank == 0:
+                observed = self.model.atomic_model.observed_type
+                if observed is not None:
+                    model_params.setdefault("info", {})["observed_type"] = observed
+                    self.model.model_def_script = json.dumps(model_params)
+            (
+                self.training_dataloader,
+                self.training_data,
+                self.validation_dataloader,
+                self.validation_data,
+                self.valid_numb_batch,
+            ) = get_data_loader(training_data, validation_data, training_params)
+            training_data.print_summary(
+                "training",
+                to_numpy_array(self.training_dataloader.sampler.weights)
+                if not isinstance(training_data, LmdbDataset)
+                else [1.0],
+            )
+            if validation_data is not None:
+                validation_data.print_summary(
+                    "validation",
+                    to_numpy_array(self.validation_dataloader.sampler.weights)
+                    if not isinstance(validation_data, LmdbDataset)
+                    else [1.0],
+                )
+        else:
+            (
+                self.training_dataloader,
+                self.training_data,
+                self.validation_dataloader,
+                self.validation_data,
+                self.valid_numb_batch,
+                self.get_sample_func,
+            ) = {}, {}, {}, {}, {}, {}
+            for model_key in self.model_keys:
+                # add data requirement for labels
+                data_requirement = self.loss[model_key].label_requirement
+                data_requirement += get_additional_data_requirement(
+                    self.model[model_key]
+                )
+                min_pair_dist = float(
+                    training_params["data_dict"][model_key]
+                    .get("training_data", {})
+                    .get("min_pair_dist", 0.0)
+                )
+                if min_pair_dist > 0.0:
+                    data_requirement.append(
+                        DataRequirementItem(
+                            "min_pair_dist",
+                            ndof=1,
+                            atomic=False,
+                            must=False,
+                            high_prec=False,
+                            default=min_pair_dist,
+                            source_policy="derived",
+                        )
+                    )
+                training_data[model_key].add_data_requirement(data_requirement)
+                if validation_data[model_key] is not None:
+                    validation_data[model_key].add_data_requirement(
+                        self.loss[model_key].label_requirement
+                        + get_additional_data_requirement(self.model[model_key])
+                    )
+                # Preload and apply modifiers to all data before computing statistics
+                training_data[model_key].preload_and_modify_all_data_torch()
+                if validation_data[model_key] is not None:
+                    validation_data[model_key].preload_and_modify_all_data_torch()
+                _mt_user_observed = (
+                    model_params["model_dict"][model_key]
+                    .get("info", {})
+                    .get("observed_type")
+                )
+                self.get_sample_func[model_key] = single_model_stat(
+                    self.model[model_key],
+                    model_params["model_dict"][model_key].get("data_stat_nbatch", 10),
+                    training_data[model_key],
+                    self.stat_file_specs[model_key],
+                    _min_pair_dist=min_pair_dist,
+                    _data_stat_full=model_params["model_dict"][model_key].get(
+                        "data_stat_full", False
+                    ),
+                    finetune_has_new_type=self.finetune_links[
+                        model_key
+                    ].get_has_new_type()
+                    if self.finetune_links is not None
+                    else False,
+                    preset_observed_type=_mt_user_observed,
+                )
+                # Persist observed_type into model_params and model_def_script
+                if not resuming and self.rank == 0:
+                    observed = self.model[model_key].atomic_model.observed_type
+                    if observed is not None:
+                        model_params["model_dict"][model_key].setdefault("info", {})[
+                            "observed_type"
+                        ] = observed
+                        self.model[model_key].model_def_script = json.dumps(
+                            model_params["model_dict"][model_key]
+                        )
+
+                (
+                    self.training_dataloader[model_key],
+                    self.training_data[model_key],
+                    self.validation_dataloader[model_key],
+                    self.validation_data[model_key],
+                    self.valid_numb_batch[model_key],
+                ) = get_data_loader(
+                    training_data[model_key],
+                    validation_data[model_key],
+                    training_params["data_dict"][model_key],
+                )
+
+                training_data[model_key].print_summary(
+                    f"training in {model_key}",
+                    to_numpy_array(self.training_dataloader[model_key].sampler.weights)
+                    if not isinstance(training_data[model_key], LmdbDataset)
+                    else [1.0],
+                )
+                if (
+                    validation_data is not None
+                    and validation_data[model_key] is not None
+                ):
+                    validation_data[model_key].print_summary(
+                        f"validation in {model_key}",
+                        to_numpy_array(
+                            self.validation_dataloader[model_key].sampler.weights
+                        )
+                        if not isinstance(validation_data[model_key], LmdbDataset)
+                        else [1.0],
+                    )
+
+        # Resolve training steps
+        def epoch_length(model_key: str) -> int:
+            """Return the batches this rank consumes in one epoch of a task."""
+            _data = training_data[model_key] if self.multi_task else training_data
+            _dataloader = (
+                self.training_dataloader[model_key]
+                if self.multi_task
+                else self.training_dataloader
+            )
+            if isinstance(_data, LmdbDataset):
+                return len(_dataloader)
+            return compute_total_numb_batch(
+                _data.index,
+                to_numpy_array(_dataloader.sampler.weights),
+            )
+
+        schedule = resolve_step_schedule(
+            training_params,
+            multi_task=self.multi_task,
+            model_keys=self.model_keys,
+            training_data=(
+                training_data
+                if self.multi_task
+                else {self.model_keys[0]: training_data}
+            ),
+            epoch_length=epoch_length,
+            broadcast=self._broadcast_value_from_rank0,
+            rank=self.rank,
+        )
+        self.num_steps = schedule.num_steps
+        self.model_prob = schedule.model_prob
+
+        # === Checkpoint layout ===
+        # num_steps is final here (including when derived from num_epoch), so a
+        # retention ratio can be converted into an absolute keep count once.
+        self.ckpt_store, self.ema_ckpt_store = build_checkpoint_stores(
+            training_params,
+            num_steps=self.num_steps,
+            ema_prefix=self.ema_save_ckpt,
+            rank=self.rank,
+        )
+
+        # Learning rate
+        self.gradient_max_norm = training_params.get("gradient_max_norm", 0.0)
+        self.nonfinite_grad_guard = NonFiniteGradGuard()
+        self.lr_schedule = get_lr(config["learning_rate"])
+
+        # Minimum pairwise distance for filtering unphysical frames during training.
+        if self.multi_task:
+            self.min_pair_dist: float | dict[str, float] = {
+                model_key: float(
+                    training_params["data_dict"][model_key]
+                    .get("training_data", {})
+                    .get("min_pair_dist", 0.0)
+                )
+                for model_key in self.model_keys
+            }
+        else:
+            self.min_pair_dist = float(
+                training_params.get("training_data", {}).get("min_pair_dist", 0.0)
+            )
+        self.has_min_pair_filter = (
+            any(value > 0.0 for value in self.min_pair_dist.values())
+            if isinstance(self.min_pair_dist, dict)
+            else self.min_pair_dist > 0.0
+        )
+        if self.has_min_pair_filter:
+            if self.multi_task:
+                local_training_batch_attempts = max(
+                    max(1, len(self.training_dataloader[model_key]))
+                    for model_key in self.model_keys
+                )
+            else:
+                local_training_batch_attempts = max(1, len(self.training_dataloader))
+            # Rank-specific task sampling may select loaders of different
+            # lengths, but validity collectives must use one shared retry count.
+            self._training_batch_attempts = int(
+                self._broadcast_value_from_rank0(local_training_batch_attempts)
+            )
+        else:
+            self._training_batch_attempts = 1
+        self._discarded_training_batches = 0
+
+        # JIT
+        if JIT:
+            self.model = torch.jit.script(self.model)
+
+        # Model Wrapper
+        self.wrapper = ModelWrapper(self.model, self.loss, model_params=model_params)
+        self.start_step = 0
+
+        # resuming and finetune
+        optimizer_state_dict = None
+        ema_state_dict = None
+        if resuming:
+            log.info(f"Resuming from {resume_model}.")
+            state_dict = torch.load(
+                resume_model, map_location=DEVICE, weights_only=True
+            )
+            if "model" in state_dict:
+                ema_state_dict = (
+                    state_dict.get(EMA_CHECKPOINT_KEY)
+                    if finetune_model is None and self.restart_training
+                    else None
+                )
+                optimizer_state_dict = (
+                    state_dict["optimizer"] if finetune_model is None else None
+                )
+                state_dict = state_dict["model"]
+            self.start_step = (
+                state_dict["_extra_state"]["train_infos"]["step"]
+                if self.restart_training
+                else 0
+            )
+            if self.rank == 0:
+                if force_load:
+                    input_keys = list(state_dict.keys())
+                    target_keys = list(self.wrapper.state_dict().keys())
+                    missing_keys = [
+                        item for item in target_keys if item not in input_keys
+                    ]
+                    if missing_keys:
+                        target_state_dict = self.wrapper.state_dict()
+                        slim_keys = []
+                        for item in missing_keys:
+                            state_dict[item] = target_state_dict[item].clone().detach()
+                            new_key = True
+                            for slim_key in slim_keys:
+                                if slim_key in item:
+                                    new_key = False
+                                    break
+                            if new_key:
+                                tmp_keys = ".".join(item.split(".")[:3])
+                                slim_keys.append(tmp_keys)
+                        slim_keys = [i + ".*" for i in slim_keys]
+                        log.warning(
+                            f"Force load mode allowed! These keys are not in ckpt and will re-init: {slim_keys}"
+                        )
+                # update model params in the pretrained model
+                if finetune_model is not None:
+                    new_state_dict = {}
+                    target_state_dict = self.wrapper.state_dict()
+                    # pretrained_model
+                    pretrained_model_params = state_dict["_extra_state"]["model_params"]
+                    with scoped_env_defaults(eval_env_defaults):
+                        pretrained_model = get_model_for_wrapper(
+                            pretrained_model_params
+                        )
+                        pretrained_model_wrapper = ModelWrapper(pretrained_model)
+                    pretrained_model_wrapper.load_state_dict(state_dict)
+                    # update type related params
+                    for model_key in self.model_keys:
+                        finetune_rule_single = self.finetune_links[model_key]
+                        _model_key_from = finetune_rule_single.get_model_branch()
+                        # skip if updated
+                        if (
+                            finetune_rule_single.get_finetune_tmap()
+                            != pretrained_model_wrapper.model[
+                                _model_key_from
+                            ].get_type_map()
+                        ):
+                            model_with_new_type_stat = None
+                            if finetune_rule_single.get_has_new_type():
+                                model_with_new_type_stat = self.wrapper.model[model_key]
+                            pretrained_model_wrapper.model[
+                                _model_key_from
+                            ].change_type_map(
+                                finetune_rule_single.get_finetune_tmap(),
+                                model_with_new_type_stat=model_with_new_type_stat,
+                            )
+                    state_dict = pretrained_model_wrapper.state_dict()
+
+                    def collect_single_finetune_params(
+                        _model_key: str,
+                        _finetune_rule_single: Any,
+                        _new_state_dict: dict[str, Any],
+                        _origin_state_dict: dict[str, Any],
+                        _random_state_dict: dict[str, Any],
+                    ) -> None:
+                        _new_fitting = _finetune_rule_single.get_random_fitting()
+                        _model_key_from = _finetune_rule_single.get_model_branch()
+                        _input_model_params = (
+                            model_params["model_dict"][_model_key]
+                            if self.multi_task
+                            else model_params
+                        )
+                        _pretrained_model_params = (
+                            pretrained_model_params["model_dict"][_model_key_from]
+                            if "model_dict" in pretrained_model_params
+                            else pretrained_model_params
+                        )
+                        if (
+                            "descriptor" in _input_model_params
+                            and "descriptor" in _pretrained_model_params
+                        ):
+                            warn_configuration_mismatch_during_finetune(
+                                _input_model_params["descriptor"],
+                                _pretrained_model_params["descriptor"],
+                                _model_key_from,
+                            )
+                        target_keys = [
+                            i
+                            for i in _random_state_dict.keys()
+                            if i != "_extra_state" and f".{_model_key}." in i
+                        ]
+                        for item_key in target_keys:
+                            new_key = item_key.replace(
+                                f".{_model_key}.", f".{_model_key_from}."
+                            )
+                            use_random_initialization = _new_fitting and (
+                                ".descriptor." not in item_key
+                            )
+                            if (
+                                not use_random_initialization
+                                and new_key not in _origin_state_dict
+                            ):
+                                # for ZBL models finetuning from standard models
+                                if ".models.0." in new_key:
+                                    new_key = new_key.replace(".models.0.", ".")
+                                elif ".models.1." in new_key:
+                                    use_random_initialization = True
+                                else:
+                                    raise KeyError(
+                                        f"Key {new_key} not found in pretrained model."
+                                    )
+                            if use_random_initialization:
+                                # print(f'Keep {item_key} in old model!')
+                                _new_state_dict[item_key] = (
+                                    _random_state_dict[item_key].clone().detach()
+                                )
+                            else:
+                                # print(f'Replace {item_key} with {new_key} in pretrained_model!')
+                                _new_state_dict[item_key] = (
+                                    _origin_state_dict[new_key].clone().detach()
+                                )
+
+                    # collect model params from the pretrained model
+                    for model_key in self.model_keys:
+                        finetune_rule_single = self.finetune_links[model_key]
+                        collect_single_finetune_params(
+                            model_key,
+                            finetune_rule_single,
+                            new_state_dict,
+                            state_dict,
+                            target_state_dict,
+                        )
+                    state_dict = new_state_dict
+                    state_dict["_extra_state"] = self.wrapper.state_dict()[
+                        "_extra_state"
+                    ]
+
+                # Always use current model_params so newly added fields
+                # (e.g. bridging_method) are persisted in checkpoints.
+                state_dict["_extra_state"] = self.wrapper.state_dict()["_extra_state"]
+                self.wrapper.load_state_dict(state_dict)
+
+            if finetune_model is not None:
+                for model_key in self.model_keys:
+                    finetune_rule = self.finetune_links[model_key]
+                    if self.multi_task and finetune_rule.get_resuming():
+                        log.info("Model branch %s will resume training.", model_key)
+                        continue
+                    if self.multi_task:
+                        log.info(
+                            "Model branch %s will be fine-tuned. "
+                            "This may take a long time...",
+                            model_key,
+                        )
+
+                    def update_finetune_bias(
+                        _model_key: str = model_key,
+                        _finetune_rule: Any = finetune_rule,
+                    ) -> None:
+                        model = (
+                            self.model[_model_key] if self.multi_task else self.model
+                        )
+                        model = model_change_out_bias(
+                            model,
+                            self.get_sample_func[_model_key]
+                            if self.multi_task
+                            else self.get_sample_func,
+                            _bias_adjust_mode="change-by-statistic"
+                            if not _finetune_rule.get_random_fitting()
+                            else "set-by-statistic",
+                        )
+                        if self.multi_task:
+                            self.model[_model_key] = model
+                        else:
+                            self.model = model
+
+                    self._run_stat_on_chief(
+                        update_finetune_bias,
+                        operation=f"fine-tuning statistics for task {model_key!r}",
+                    )
+
+        if init_frz_model is not None:
+            frz_model = torch.jit.load(init_frz_model, map_location=DEVICE)
+            state = frz_model.state_dict()
+            missing, unexpected = self.model.load_state_dict(state, strict=False)
+            if missing or unexpected:
+                log.warning(
+                    f"Checkpoint loaded non-strictly. Missing keys: {missing}, Unexpected keys: {unexpected}"
+                )
+
+        # Multi-task share params
+        if shared_links is not None:
+            _data_stat_protect = np.array(
+                [
+                    model_params["model_dict"][ii].get("data_stat_protect", 1e-2)
+                    for ii in model_params["model_dict"]
+                ]
+            )
+            assert np.allclose(_data_stat_protect, _data_stat_protect[0]), (
+                "Model key 'data_stat_protect' must be the same in each branch when multitask!"
+            )
+            share_kwargs = {
+                "model_key_prob_map": dict(
+                    zip(self.model_keys, self.model_prob, strict=True)
+                ),
+                "data_stat_protect": _data_stat_protect[0],
+            }
+            if not has_initial_state or finetune_updates_statistics:
+                self._run_stat_on_chief(
+                    lambda: self.wrapper.share_params(
+                        shared_links,
+                        resume=False,
+                        **share_kwargs,
+                    ),
+                    operation="shared statistics merge",
+                )
+            self.wrapper.share_params(
+                shared_links,
+                resume=True,
+                **share_kwargs,
+            )
+
+        # LoRA injection (single-task only; argcheck rejects multi-task).
+        self._lora_enabled = False
+        if not self.multi_task:
+            _lora_cfg = model_params.get("lora")
+            if _lora_cfg is not None:
+                # "Default" is the fixed key ModelWrapper assigns to the sole
+                # single-task model (see wrapper.py); finetune `--model-branch`
+                # has already selected pretrained weights for this slot.
+                _branch_model = self.wrapper.model["Default"]
+                if not isinstance(_branch_model, SeZMModel):
+                    log.warning(
+                        "[LoRA] skipping: model is not SeZMModel; "
+                        "LoRA fine-tuning is only supported for SeZM."
+                    )
+                else:
+                    apply_lora_to_sezm(
+                        _branch_model,
+                        rank=int(_lora_cfg["rank"]),
+                        alpha=_lora_cfg.get("alpha"),
+                    )
+                    self._lora_enabled = True
+                    log.info(
+                        f"[LoRA] injected: rank={_lora_cfg['rank']}, "
+                        f"alpha={_lora_cfg.get('alpha', _lora_cfg['rank'])}"
+                    )
+
+        if self.is_distributed:
+            torch.cuda.set_device(LOCAL_RANK)
+            if self.sharding.shards_parameters:
+                if fully_shard is None:
+                    raise RuntimeError(
+                        "training.zero_stage>=2 requires FSDP2, which is only "
+                        "available in PyTorch >= 2.6 "
+                        "(``torch.distributed.fsdp.fully_shard``). "
+                        f"Current PyTorch is {torch.__version__}. "
+                        "Please upgrade PyTorch, or set training.zero_stage "
+                        "to 0 or 1 to stay on the DDP / ZeRO-1 path."
+                    )
+                # FSDP2 does NOT broadcast params (unlike DDP constructor).
+                # Ensure all ranks share identical weights before sharding.
+                for p in self.wrapper.parameters():
+                    dist.broadcast(p.data, src=0)
+                for b in self.wrapper.buffers():
+                    dist.broadcast(b.data, src=0)
+                reshard = self.sharding.reshards_after_forward
+                self.wrapper = fully_shard(self.wrapper, reshard_after_forward=reshard)
+            else:
+                # zero_stage=0 or 1: standard DDP (ZeRO-1 will wrap the optimizer)
+                #
+                # ``find_unused_parameters`` makes the reducer traverse the
+                # autograd graph on every iteration to find parameters that
+                # produced no gradient bucket, which it would otherwise wait
+                # for forever. Multi-task needs it, because a step uses one
+                # fitting net and leaves the others out of the graph. A
+                # single-task step reaches every parameter (an all-zero
+                # gradient still produces a bucket), so the traversal is pure
+                # overhead there. A configuration that did leave a parameter
+                # out of the graph would hang the reducer rather than fail, so
+                # an optional branch added later has to be checked against
+                # this assumption before it ships.
+                self.wrapper = DDP(
+                    self.wrapper,
+                    device_ids=[LOCAL_RANK],
+                    find_unused_parameters=self.multi_task,
+                    output_device=LOCAL_RANK,
+                )
+
+        # TODO add lr warmups for multitask
+        # author: iProzd
+        # TODO add optimizers for multitask
+        # author: iProzd
+        initial_lr = self.lr_schedule.value(self.start_step)
+        if self.opt_type == "LKF":
+            self.optimizer = LKFOptimizer(
+                self.wrapper.parameters(), 0.98, 0.99870, self.opt_param["kf_blocksize"]
+            )
+        else:
+            # === Common path for gradient-based optimizers ===
+            adam_betas = (
+                float(self.opt_param["adam_beta1"]),
+                float(self.opt_param["adam_beta2"]),
+            )
+            weight_decay = float(self.opt_param["weight_decay"])
+            runtime_named_parameters = tuple(self.wrapper.named_parameters())
+
+            if self.opt_type in ("Adam", "AdamW"):
+                cls = torch.optim.Adam if self.opt_type == "Adam" else torch.optim.AdamW
+                extra = {"betas": adam_betas, "fused": DEVICE.type != "cpu"}
+            elif self.opt_type == "AdaMuon":
+                cls = AdaMuonOptimizer
+                extra = {
+                    "adam_betas": adam_betas,
+                    "momentum": float(self.opt_param["momentum"]),
+                    "lr_adjust": float(self.opt_param["lr_adjust"]),
+                    "lr_adjust_coeff": float(self.opt_param["lr_adjust_coeff"]),
+                }
+            elif self.opt_type == "HybridMuon":
+                cls = HybridMuonOptimizer
+                extra = {
+                    "adam_betas": adam_betas,
+                    "momentum": float(self.opt_param["momentum"]),
+                    "lr_adjust": float(self.opt_param["lr_adjust"]),
+                    "lr_adjust_coeff": float(self.opt_param["lr_adjust_coeff"]),
+                    "muon_mode": str(self.opt_param.get("muon_mode", "slice")),
+                    "enable_gram": bool(self.opt_param.get("enable_gram")),
+                    "flash_muon": bool(self.opt_param.get("flash_muon")),
+                    "magma_muon": bool(self.opt_param.get("magma_muon")),
+                    "adam_patterns": adam_route_patterns(
+                        self._get_inner_module().model.values()
+                    ),
+                    # FSDP2 shards parameters as DTensor; several torch._foreach_*
+                    # ops lack DTensor sharding propagation on older PyTorch, so
+                    # fall back to the per-tensor path under zero_stage >= 2.
+                    # DDP / ZeRO-1 keep plain tensors and use the default.
+                    "use_foreach": False if self.sharding.shards_parameters else None,
+                }
+            else:
+                raise ValueError(f"Not supported optimizer type '{self.opt_type}'")
+
+            self.optimizer = self._create_optimizer(
+                cls,
+                lr=initial_lr,
+                weight_decay=weight_decay,
+                **extra,
+            )
+            if self.opt_type == "HybridMuon":
+                target_optimizer = (
+                    self.optimizer.optim if self.sharding.stage == 1 else self.optimizer
+                )
+                target_optimizer.set_param_names(runtime_named_parameters)
+            self._load_optimizer_state(optimizer_state_dict)
+            self.scheduler = self._create_lr_scheduler(
+                self.optimizer,
+                self.lr_schedule,
+                self.start_step,
+            )
+
+        self.model_ema = None
+        if self.enable_ema:
+            self.model_ema = ModelEMA(
+                self.model,
+                decay=self.ema_decay,
+                state=ema_state_dict,
+            )
+
+        if self.sharding.enabled:
+            log.info(self.sharding.describe())
+
+        # Tensorboard
+        self.enable_tensorboard = training_params.get("tensorboard", False)
+        self.tensorboard_log_dir = training_params.get("tensorboard_log_dir", "log")
+        self.tensorboard_freq = training_params.get("tensorboard_freq", 1)
+        self.enable_profiler = training_params.get("enable_profiler", False)
+        self.profiling = training_params.get("profiling", False)
+        self.profiling_file = training_params.get("profiling_file", "timeline.json")
+        self.full_validator, self.ema_full_validator = self._create_full_validators(
+            validating_params=validating_params,
+            validation_data=validation_data,
+        )
+
+        # Log model parameter count
+        if is_node_main_process(self.rank):
+            self._log_parameter_count()
+
+    def _run_stat_on_chief(
+        self,
+        action: Callable[[], None],
+        *,
+        operation: str,
+    ) -> None:
+        """Run a statistics action on rank 0 and synchronize its outcome."""
+        synchronize_failure: Callable[[bool], bool] | None = None
+        if self.is_distributed:
+
+            def broadcast_failure(failed: bool) -> bool:
+                holder = [failed if self.rank == 0 else False]
+                dist.broadcast_object_list(holder, src=0, device=DEVICE)
+                return bool(holder[0])
+
+            synchronize_failure = broadcast_failure
+
+        run_stat_on_chief(
+            action,
+            is_chief=self.rank == 0,
+            synchronize_failure=synchronize_failure,
+            operation=operation,
+        )
+
+    def _broadcast_value_from_rank0(self, value: Any) -> Any:
+        """Return rank 0's copy of ``value`` on every rank.
+
+        ``num_steps`` derived from ``num_epoch`` ultimately depends on the
+        per-rank sampler weights, whose tiny floating-point differences can
+        shift the rounded batch count -- and therefore ``num_steps`` -- by a
+        single unit across ranks. A drifting ``num_steps`` makes ranks
+        disagree on the full-validation start step, so some ranks enter the
+        validation barrier while the others keep training, deadlocking the
+        mismatched collective calls. Pinning every rank to rank 0's value
+        keeps the whole training schedule in lockstep.
+        """
+        if not self.is_distributed:
+            return value
+        holder = [value]
+        dist.broadcast_object_list(holder, src=0, device=DEVICE)
+        return holder[0]
+
+    @staticmethod
+    def _create_lr_scheduler(
+        optimizer: torch.optim.Optimizer,
+        lr_schedule: BaseLR,
+        start_step: int,
+    ) -> torch.optim.lr_scheduler.LambdaLR:
+        base_lr = float(lr_schedule.start_lr)
+        for group in optimizer.param_groups:
+            group["initial_lr"] = base_lr
+        return torch.optim.lr_scheduler.LambdaLR(
+            optimizer,
+            lambda step: lr_schedule.value(step) / base_lr,
+            last_epoch=start_step - 1,
+        )
+
+    def _create_full_validators(
+        self,
+        *,
+        validating_params: dict[str, Any],
+        validation_data: DpLoaderSet | None,
+    ) -> tuple[FullValidator | None, FullValidator | None]:
+        """Create the live-weight and EMA-weight full validators."""
+        return build_full_validators(
+            validating_params=validating_params,
+            validation_data=validation_data,
+            model=self.model,
+            state_store=self._get_inner_module().train_infos,
+            num_steps=self.num_steps,
+            rank=self.rank,
+            restart_training=self.restart_training,
+            checkpoint_dir=resolve_best_checkpoint_dir(
+                validating_params, self.save_ckpt
+            ),
+            ensure_supported=lambda: self._raise_if_full_validation_unsupported(
+                validation_data
+            ),
+            model_ema=self.model_ema,
+            sharding=self.sharding,
+        )
+
+    def _raise_if_full_validation_unsupported(
+        self,
+        validation_data: DpLoaderSet | None,
+    ) -> None:
+        """Validate runtime full validation constraints."""
+        if self.multi_task:
+            raise ValueError(
+                "validating.full_validation only supports single-task energy "
+                "training; multi-task training is not supported."
+            )
+
+        if not isinstance(self.loss, (EnergyStdLoss, EnergySpinLoss)):
+            raise ValueError(
+                "validating.full_validation only supports single-task energy "
+                "or spin-energy training."
+            )
+
+        if validation_data is None:
+            raise ValueError(
+                "validating.full_validation requires `training.validation_data` "
+                "to be configured."
+            )
+
+        if self.sharding.shards_parameters:
+            raise ValueError(
+                "validating.full_validation only supports single-task energy "
+                "training with training.zero_stage < 2."
+            )
+
+    def _log_parameter_count(self) -> None:
+        """Log model parameter count."""
+        models = self.model if self.multi_task else {DEFAULT_TASK_KEY: self.model}
+        log_parameter_counts(
+            {key: count_parameters(models[key]) for key in self.model_keys},
+            multi_task=self.multi_task,
+        )
+
+    def _create_optimizer(
+        self,
+        optimizer_class: type[torch.optim.Optimizer],
+        **kwargs: Any,
+    ) -> torch.optim.Optimizer:
+        """
+        Construct optimizer, wrapping with ZeroRedundancyOptimizer when zero_stage=1.
+
+        Parameters
+        ----------
+        optimizer_class : type[torch.optim.Optimizer]
+            The optimizer class to instantiate.
+        **kwargs : Any
+            Keyword arguments forwarded to the optimizer constructor.
+
+        Returns
+        -------
+        torch.optim.Optimizer
+            Constructed optimizer instance.
+        """
+        if self.sharding.stage == 1:
+            return ZeroRedundancyOptimizer(
+                self.wrapper.parameters(),
+                optimizer_class=optimizer_class,
+                **kwargs,
+            )
+        return optimizer_class(self.wrapper.parameters(), **kwargs)
+
+    def _get_inner_module(self) -> ModelWrapper:
+        """Unwrap DDP if needed. FSDP2 is in-place so no unwrapping required."""
+        if self.is_distributed and not self.sharding.shards_parameters:
+            return self.wrapper.module
+        return self.wrapper
+
+    def _load_optimizer_state(
+        self, optimizer_state_dict: dict[str, Any] | None
+    ) -> None:
+        """Load optimizer state for restart training when available."""
+        if optimizer_state_dict is None or not self.restart_training:
+            return
+        if self.sharding.shards_parameters:
+            set_optimizer_state_dict(
+                self.wrapper,
+                self.optimizer,
+                optim_state_dict=optimizer_state_dict,
+                options=StateDictOptions(
+                    full_state_dict=True, broadcast_from_rank0=True
+                ),
+            )
+        else:
+            self.optimizer.load_state_dict(optimizer_state_dict)
+
+    def _precompile_outside_collectives(self) -> None:
+        """Trigger every training-graph compilation before the first collective.
+
+        The first optimization step both compiles the model and joins the
+        first gradient all-reduce. Compilation of the larger configurations
+        runs for tens of minutes with unbounded variance across ranks (GEMM
+        autotuning benchmarks on each rank's own device), so a rank still
+        compiling while its peers sit in that all-reduce trips the NCCL
+        watchdog and aborts the job. One forward and backward per task on the
+        *inner* module therefore runs first: the compiled artifacts are keyed
+        by the module and its input shapes, so warming them there is what the
+        optimization step reuses. ``torch.autograd.grad`` compiles the same
+        backward without accumulating parameter gradients; the reducer hooks
+        attached to ``AccumulateGrad`` therefore remain dormant. A rendezvous
+        store barrier (which has no watchdog) then aligns the ranks before the
+        first real step.
+        """
+        if not (dist.is_available() and dist.is_initialized()):
+            return
+        if not isinstance(self.wrapper, DDP):
+            return
+        if self.opt_type not in ("Adam", "AdamW", "AdaMuon", "HybridMuon"):
+            return
+        inner = self._get_inner_module()
+        if not any(getattr(module, "use_compile", False) for module in inner.modules()):
+            return
+        log.info(
+            "Compiling training graphs before the first collective.",
+            extra={"rank_scope": "all"},
+        )
+        start = time.time()
+        trainable_parameters = tuple(
+            parameter for parameter in inner.parameters() if parameter.requires_grad
+        )
+        for task_key in self.model_keys if self.multi_task else ["Default"]:
+            input_dict, label_dict, _ = self._next_training_batch(task_key)
+            _, loss, _ = inner(
+                **input_dict,
+                cur_lr=self.lr_schedule.value(0),
+                label=label_dict,
+                task_key=task_key,
+            )
+            torch.autograd.grad(loss, trainable_parameters, allow_unused=True)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        log.info(
+            "Training graphs ready in %.1f s; waiting for the other ranks.",
+            time.time() - start,
+            extra={"rank_scope": "all"},
+        )
+        store = dist.distributed_c10d._get_default_store()
+        key = "deepmd/precompile_ready"
+        world_size = dist.get_world_size()
+        ready = int(store.add(key, 1))
+        while ready < world_size:
+            time.sleep(2)
+            ready = int(store.add(key, 0))
+        log.info("All %d ranks compiled; entering the optimization loop.", world_size)
+
+    def run(self) -> None:
+        """Run training and release asynchronous data pipelines."""
+        try:
+            self._run()
+        finally:
+            self._close_lmdb_loaders()
+
+    def _training_results(
+        self, more_loss: dict[str, Any], task_key: str = "Default"
+    ) -> dict[str, Any]:
+        """Return interval averages or the current step's display metrics."""
+        if self.metric_accumulator is not None:
+            return self.metric_accumulator.average(task_key)
+        return {
+            name: value
+            for name, value in sorted(more_loss.items())
+            if "l2_" not in name
+        }
+
+    def _run(self) -> None:
+        """Execute the PyTorch optimization loop."""
+        fout = (
+            open(
+                self.disp_file,
+                mode="w" if not self.restart_training else "a",
+                buffering=1,
+            )
+            if self.rank == 0
+            else None
+        )  # line buffered
+        if SAMPLER_RECORD:
+            record_file = f"Sample_rank_{self.rank}.txt"
+            fout1 = open(record_file, mode="w", buffering=1)
+        log.info("Start to train %d steps.", self.num_steps)
+        self._precompile_outside_collectives()
+        if self.enable_tensorboard:
+            from torch.utils.tensorboard import (
+                SummaryWriter,
+            )
+
+            writer = SummaryWriter(log_dir=self.tensorboard_log_dir)
+        if self.enable_profiler or self.profiling:
+            prof = torch.profiler.profile(
+                schedule=torch.profiler.schedule(wait=1, warmup=15, active=3, repeat=1),
+                on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                    self.tensorboard_log_dir
+                )
+                if self.enable_profiler
+                else None,
+                record_shapes=True,
+                with_stack=True,
+            )
+            prof.start()
+
+        def step(_step_id: int, task_key: str = "Default") -> None:
+            display_step_id = _step_id + 1
+            if self.multi_task:
+                model_index = dp_random.choice(
+                    np.arange(self.num_model, dtype=np.int_),
+                    p=self.model_prob,
+                )
+                task_key = self.model_keys[model_index]
+            # PyTorch Profiler
+            if self.enable_profiler or self.profiling:
+                prof.step()
+            cur_lr = self.lr_schedule.value(_step_id)
+            pref_lr = cur_lr
+            self.optimizer.zero_grad(set_to_none=True)
+            input_dict, label_dict, log_dict = self._next_training_batch(task_key)
+            if SAMPLER_RECORD:
+                print_str = f"Step {_step_id}: sample system{log_dict['sid']}  frame{log_dict['fid']}\n"
+                fout1.write(print_str)
+                fout1.flush()
+            if self.opt_type in ["Adam", "AdamW", "AdaMuon", "HybridMuon"]:
+                cur_lr = self.scheduler.get_last_lr()[0]
+                pref_lr = cur_lr
+                model_pred, loss, more_loss = self.wrapper(
+                    **input_dict, cur_lr=pref_lr, label=label_dict, task_key=task_key
+                )
+                loss.backward()
+                # === Initialize gradient diagnostics variables ===
+                total_norm: torch.Tensor | None = None
+                pre_clip_named_norms: list[tuple[str, float]] = []
+                if self.gradient_max_norm > 0.0:
+                    # Collect per-parameter gradient norms before clipping.
+                    # NOTE: Under FSDP2 with ZeRO stage >= 2, p.grad is a sharded DTensor,
+                    # so p.grad.norm() computes the shard-local L2 norm, not the full-parameter
+                    # norm. Skip per-param collection in this case to avoid misleading values.
+                    if (
+                        self.enable_tensorboard
+                        and not self.sharding.shards_parameters
+                        and (
+                            display_step_id % self.tensorboard_freq == 0
+                            or display_step_id == 1
+                        )
+                    ):
+                        pre_clip_named_norms = [
+                            (name, p.grad.detach().norm().item())
+                            for name, p in self.wrapper.named_parameters()
+                            if p.grad is not None
+                        ]
+                    total_norm = clip_grad_norm_(
+                        self.wrapper.parameters(),
+                        self.gradient_max_norm,
+                        stable=not self.sharding.shards_parameters,
+                    )
+                    self.nonfinite_grad_guard.update(total_norm)
+                with torch.device(DEVICE):
+                    self.optimizer.step()
+                self.scheduler.step()
+            elif self.opt_type == "LKF":
+                if isinstance(self.loss, EnergyStdLoss):
+                    KFOptWrapper = KFOptimizerWrapper(
+                        self.wrapper,
+                        self.optimizer,
+                        24,
+                        6,
+                        dist.is_available() and dist.is_initialized(),
+                    )
+                    pref_e = self.opt_param["kf_start_pref_e"] * (
+                        self.opt_param["kf_limit_pref_e"]
+                        / self.opt_param["kf_start_pref_e"]
+                    ) ** (_step_id / self.num_steps)
+                    _ = KFOptWrapper.update_energy(
+                        input_dict, label_dict["energy"], pref_e
+                    )
+                    pref_f = self.opt_param["kf_start_pref_f"] * (
+                        self.opt_param["kf_limit_pref_f"]
+                        / self.opt_param["kf_start_pref_f"]
+                    ) ** (_step_id / self.num_steps)
+                    p_energy, p_force = KFOptWrapper.update_force(
+                        input_dict, label_dict["force"], pref_f
+                    )
+                    # [coord, atype, natoms, mapping, shift, nlist, box]
+                    model_pred = {"energy": p_energy, "force": p_force}
+                    module = (
+                        self.wrapper.module
+                        if dist.is_available() and dist.is_initialized()
+                        else self.wrapper
+                    )
+
+                    def fake_model() -> dict:
+                        return model_pred
+
+                    _, loss, more_loss = module.loss[task_key](
+                        {},
+                        fake_model,
+                        label_dict,
+                        int(input_dict["atype"].shape[-1]),
+                        learning_rate=pref_lr,
+                    )
+            else:
+                raise ValueError(f"Not supported optimizer type '{self.opt_type}'")
+
+            if self.model_ema is not None:
+                self.model_ema.update(self.model)
+
+            if self.metric_accumulator is not None:
+                self.metric_accumulator.add(
+                    task_key,
+                    {
+                        name: value.detach() if torch.is_tensor(value) else value
+                        for name, value in more_loss.items()
+                        if "l2_" not in name
+                    },
+                )
+
+            # Log and persist
+            if self.display_in_training and (
+                display_step_id % self.disp_freq == 0 or display_step_id == 1
+            ):
+                self.wrapper.eval()  # Will set to train mode before fininshing validation
+
+                def log_loss_valid(_task_key: str = "Default") -> dict:
+                    single_results = {}
+                    sum_natoms = 0
+                    if not self.multi_task:
+                        valid_numb_batch = self.valid_numb_batch
+                    else:
+                        valid_numb_batch = self.valid_numb_batch[_task_key]
+                    for ii in range(valid_numb_batch):
+                        self.optimizer.zero_grad()
+                        input_dict, label_dict, _ = self.get_data(
+                            is_train=False, task_key=_task_key
+                        )
+                        if input_dict == {}:
+                            # no validation data
+                            return {}
+                        # Validation runs the inner module, not the DDP
+                        # wrapper. A DDP forward under grad mode arms the
+                        # reducer for an all-reduce that this loop never
+                        # triggers, because it computes metrics and never
+                        # calls backward; the next real forward then aborts
+                        # with "expected to have finished reduction in the
+                        # prior iteration". Grad mode itself cannot be
+                        # dropped -- the force metrics differentiate the
+                        # energy with respect to the coordinates.
+                        _, loss, more_loss = self._get_inner_module()(
+                            **input_dict,
+                            cur_lr=pref_lr,
+                            label=label_dict,
+                            task_key=_task_key,
+                        )
+                        # more_loss.update({"rmse": math.sqrt(loss)})
+                        # The metrics are per-atom quantities, so each batch
+                        # weighs by the real atoms it holds summed over its
+                        # frames. Phantom atoms (atype < 0), which pad a
+                        # mixed-nloc batch, contribute to none of them.
+                        natoms = int((input_dict["atype"] >= 0).sum())
+                        sum_natoms += natoms
+                        for k, v in more_loss.items():
+                            if "l2_" not in k:
+                                single_results[k] = (
+                                    single_results.get(k, 0.0) + v * natoms
+                                )
+                    results = {k: v / sum_natoms for k, v in single_results.items()}
+                    return results
+
+                if not self.multi_task:
+                    train_results = self._training_results(more_loss)
+                    valid_results = log_loss_valid()
+                    if self.rank == 0:
+                        log.info(
+                            format_training_message_per_task(
+                                batch=display_step_id,
+                                task_name="trn",
+                                rmse=train_results,
+                                learning_rate=cur_lr,
+                            )
+                        )
+                        if valid_results:
+                            log.info(
+                                format_training_message_per_task(
+                                    batch=display_step_id,
+                                    task_name="val",
+                                    rmse=valid_results,
+                                    learning_rate=None,
+                                )
+                            )
+                else:
+                    train_results = {_key: {} for _key in self.model_keys}
+                    valid_results = {_key: {} for _key in self.model_keys}
+                    if self.metric_accumulator is not None:
+                        for _key in self.model_keys:
+                            train_results[_key] = self._training_results(
+                                more_loss, task_key=_key
+                            )
+                    else:
+                        train_results[task_key] = self._training_results(
+                            more_loss, task_key=task_key
+                        )
+                        for _key in self.model_keys:
+                            if _key != task_key:
+                                self.optimizer.zero_grad()
+                                input_dict, label_dict, _ = self.get_data(
+                                    is_train=True, task_key=_key
+                                )
+                                if input_dict and not (
+                                    self.is_distributed
+                                    and self.sharding.shards_parameters
+                                ):
+                                    _, loss, more_loss = self._get_inner_module()(
+                                        **input_dict,
+                                        cur_lr=pref_lr,
+                                        label=label_dict,
+                                        task_key=_key,
+                                    )
+                                    train_results[_key] = self._training_results(
+                                        more_loss, task_key=_key
+                                    )
+                    for _key in self.model_keys:
+                        valid_results[_key] = log_loss_valid(_task_key=_key)
+                        if not train_results[_key] and valid_results[_key]:
+                            train_results[_key] = dict.fromkeys(
+                                valid_results[_key],
+                                float("nan"),
+                            )
+                        if self.rank == 0:
+                            log.info(
+                                format_training_message_per_task(
+                                    batch=display_step_id,
+                                    task_name=_key + "_trn",
+                                    rmse=train_results[_key],
+                                    learning_rate=cur_lr,
+                                    check_total_rmse_nan=not (
+                                        self.metric_accumulator is not None
+                                        and self.metric_accumulator.count(_key) == 0
+                                    ),
+                                )
+                            )
+                            if valid_results[_key]:
+                                log.info(
+                                    format_training_message_per_task(
+                                        batch=display_step_id,
+                                        task_name=_key + "_val",
+                                        rmse=valid_results[_key],
+                                        learning_rate=None,
+                                    )
+                                )
+                self.wrapper.train()
+
+                if self.metric_accumulator is not None:
+                    self.metric_accumulator.reset()
+
+                interval = self.step_timer.record(display_step_id)
+                if self.rank == 0 and self.timing_in_training:
+                    log.info(
+                        format_training_message(
+                            batch=display_step_id,
+                            wall_time=interval.wall_time,
+                            eta=interval.eta,
+                            current_time=interval.timestamp,
+                        )
+                    )
+
+                if fout:
+                    if self.lcurve_should_print_header:
+                        self.print_header(fout, train_results, valid_results)
+                        self.lcurve_should_print_header = False
+                    self.print_on_training(
+                        fout, display_step_id, cur_lr, train_results, valid_results
+                    )
+
+            if self.full_validator is not None:
+                self.full_validator.run(
+                    step_id=_step_id,
+                    display_step=display_step_id,
+                    lr=cur_lr,
+                    save_checkpoint=(
+                        self.save_model_merged
+                        if self._lora_enabled
+                        else self.save_model
+                    ),
+                )
+            if self.ema_full_validator is not None:
+                self.ema_full_validator.run(
+                    step_id=_step_id,
+                    display_step=display_step_id,
+                    lr=cur_lr,
+                    save_checkpoint=(
+                        self.save_ema_model_merged
+                        if self._lora_enabled
+                        else self.save_ema_model
+                    ),
+                )
+
+            should_save_checkpoint = display_step_id == self.num_steps or (
+                self.save_freq > 0
+                and display_step_id % self.save_freq == 0
+                and _step_id != self.start_step
+            )
+            if should_save_checkpoint:
+                # Abort before writing if any gradient norm since the previous
+                # checkpoint was non-finite.
+                self.nonfinite_grad_guard.raise_if_nonfinite(
+                    self.wrapper.named_parameters
+                )
+            if should_save_checkpoint and (
+                self.sharding.enabled or self.rank == 0 or dist.get_rank() == 0
+            ):
+                # Handle the case if rank 0 aborted and re-assigned
+                self.latest_model = self.ckpt_store.path_for(display_step_id)
+                self.save_model(self.latest_model, lr=cur_lr, step=_step_id)
+                if self.rank == 0 or dist.get_rank() == 0:
+                    log.info(f"Saved model to {self.latest_model}")
+                    self.ckpt_store.publish(self.latest_model)
+                if self.model_ema is not None:
+                    self.latest_ema_model = self.ema_ckpt_store.path_for(
+                        display_step_id
+                    )
+                    self.save_ema_model(self.latest_ema_model, lr=cur_lr, step=_step_id)
+                    if self.rank == 0 or dist.get_rank() == 0:
+                        self.ema_ckpt_store.publish(self.latest_ema_model)
+
+            # tensorboard
+            if self.enable_tensorboard and (
+                display_step_id % self.tensorboard_freq == 0 or display_step_id == 1
+            ):
+                writer.add_scalar(f"{task_key}/lr", cur_lr, display_step_id)
+                writer.add_scalar(f"{task_key}/loss", loss, display_step_id)
+                for item in more_loss:
+                    writer.add_scalar(
+                        f"{task_key}/{item}", more_loss[item], display_step_id
+                    )
+                # === Gradient diagnostics (pre-clip) ===
+                # Only log if total_norm was computed (i.e., not LKF optimizer).
+                if self.gradient_max_norm > 0.0 and total_norm is not None:
+                    writer.add_scalar(
+                        f"{task_key}/grad/total_norm",
+                        total_norm.item(),
+                        display_step_id,
+                    )
+                    # Only log per-parameter norms if list is non-empty.
+                    if pre_clip_named_norms:
+                        # Use float32 for histogram to ensure numerical stability
+                        # when gradients are in lower precision (FP16/BF16).
+                        norms = torch.tensor(
+                            [gn for _, gn in pre_clip_named_norms],
+                            dtype=torch.float32,
+                            device="cpu",
+                        )
+                        writer.add_histogram(
+                            f"{task_key}/grad/param_norms", norms, display_step_id
+                        )
+                        # Log top-10 largest per-parameter gradient norms.
+                        pre_clip_named_norms.sort(key=lambda x: x[1], reverse=True)
+                        for name, gn in pre_clip_named_norms[:10]:
+                            writer.add_scalar(
+                                f"{task_key}/grad_top10/{name}", gn, display_step_id
+                            )
+
+        self.wrapper.train()
+        self.step_timer = TrainingTimer(
+            start_step=self.start_step,
+            num_steps=self.num_steps,
+            disp_freq=self.disp_freq,
+        )
+        self._discarded_training_batches = 0
+
+        losses = self.loss if self.multi_task else {"Default": self.loss}
+        self.metric_accumulator = (
+            TrainingMetricAccumulator(
+                {key: loss.training_metric_names for key, loss in losses.items()}
+            )
+            if self.disp_avg
+            else None
+        )
+
+        for step_id in range(self.start_step, self.num_steps):
+            step(step_id)
+            if JIT:
+                break
+
+        if self.rank == 0 and self._discarded_training_batches:
+            log.info(
+                "Discarded %d globally invalid batches while collecting "
+                "synchronized training inputs.",
+                self._discarded_training_batches,
+            )
+
+        if (
+            self.change_bias_after_training
+            and self.num_steps > self.start_step
+            and (self.rank == 0 or dist.get_rank() == 0)
+        ):
+            if not self.multi_task:
+                self.model = model_change_out_bias(
+                    self.model,
+                    self.get_sample_func,
+                    _bias_adjust_mode="change-by-statistic",
+                )
+            else:
+                for model_key in self.model_keys:
+                    self.model[model_key] = model_change_out_bias(
+                        self.model[model_key],
+                        self.get_sample_func[model_key],
+                        _bias_adjust_mode="change-by-statistic",
+                    )
+            self.latest_model = self.ckpt_store.path_for(self.num_steps)
+            cur_lr = self.lr_schedule.value(self.num_steps - 1)
+            self.save_model(self.latest_model, lr=cur_lr, step=self.num_steps - 1)
+            log.info(f"Saved model to {self.latest_model}")
+            self.ckpt_store.publish(self.latest_model)
+            if self.model_ema is not None:
+                self.latest_ema_model = self.ema_ckpt_store.path_for(self.num_steps)
+                self.save_ema_model(
+                    self.latest_ema_model,
+                    lr=cur_lr,
+                    step=self.num_steps - 1,
+                )
+                self.ema_ckpt_store.publish(self.latest_ema_model)
+
+        if self.num_steps == 0 and self.sharding.enabled:
+            # ZeRO-1 / FSDP: all ranks participate in save_model (collective op)
+            self.latest_model = self.ckpt_store.path_for(0)
+            self.save_model(self.latest_model, lr=0, step=0)
+            if self.model_ema is not None:
+                self.latest_ema_model = self.ema_ckpt_store.path_for(0)
+                self.save_ema_model(self.latest_ema_model, lr=0, step=0)
+
+        if (
+            self.rank == 0 or dist.get_rank() == 0
+        ):  # Handle the case if rank 0 aborted and re-assigned
+            if self.num_steps == 0:
+                if not self.sharding.enabled:
+                    # When num_steps is 0, the checkpoint is never saved in the loop
+                    self.latest_model = self.ckpt_store.path_for(0)
+                    self.save_model(self.latest_model, lr=0, step=0)
+                    if self.model_ema is not None:
+                        self.latest_ema_model = self.ema_ckpt_store.path_for(0)
+                        self.save_ema_model(self.latest_ema_model, lr=0, step=0)
+                log.info(f"Saved model to {self.latest_model}")
+                self.ckpt_store.publish(self.latest_model)
+                if self.model_ema is not None:
+                    self.ema_ckpt_store.publish(self.latest_ema_model)
+
+            if self.timing_in_training:
+                average_message = self.step_timer.format_average()
+                if average_message is not None:
+                    log.info(average_message)
+
+            if JIT:
+                pth_model_path = (
+                    "frozen_model.pth"  # We use .pth to denote the frozen model
+                )
+                self.model.save(pth_model_path)
+                log.info(
+                    f"Frozen model for inferencing has been saved to {pth_model_path}"
+                )
+            log.info(f"Trained model has been saved to: {self.save_ckpt}")
+
+        if fout:
+            fout.close()
+        if SAMPLER_RECORD:
+            fout1.close()
+        if self.enable_tensorboard:
+            writer.close()
+        if self.enable_profiler or self.profiling:
+            prof.stop()
+            if self.enable_profiler:
+                log.info(
+                    f"The profiling trace has been saved under {self.tensorboard_log_dir}"
+                )
+            if not self.enable_profiler and self.profiling:
+                prof.export_chrome_trace(self.profiling_file)
+                log.info(
+                    f"The profiling trace has been saved to: {self.profiling_file}"
+                )
+
+    def _close_lmdb_loaders(self) -> None:
+        """Release LMDB pipelines owned by training and validation loaders."""
+        closed: set[int] = set()
+        datasets: dict[int, LmdbDataset] = {}
+        for loaders in (self.training_dataloader, self.validation_dataloader):
+            values = loaders.values() if isinstance(loaders, dict) else (loaders,)
+            for loader in values:
+                if loader is None or id(loader) in closed:
+                    continue
+                closed.add(id(loader))
+                close = getattr(loader, "close", None)
+                if close is not None:
+                    close()
+                if isinstance(loader, LmdbBatchDataLoader):
+                    datasets[id(loader.dataset)] = loader.dataset
+        for dataset in datasets.values():
+            dataset.close()
+
+    def _collect_checkpoint_states(
+        self,
+        *,
+        use_ema_weights: bool = False,
+        include_optimizer: bool = True,
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        """Collect model and optimizer states for checkpointing.
+
+        Parameters
+        ----------
+        use_ema_weights : bool
+            If True, temporarily swap in EMA shadow weights before collecting
+            the model state dict.
+        include_optimizer : bool
+            If False, skip collecting the optimizer state. Used for EMA ckpts
+            where the optimizer state is meaningless: EMA has no optimizer of
+            its own, and the main model's optimizer state corresponds to a
+            different parameter trajectory.
+
+        Returns
+        -------
+        tuple[dict[str, Any], dict[str, Any] | None]
+            (model_state, optim_state). optim_state is None when
+            include_optimizer is False.
+        """
+        module = self._get_inner_module()
+        ema_context = (
+            self.model_ema.apply_shadow(self.model)
+            if use_ema_weights and self.model_ema is not None
+            else nullcontext()
+        )
+        with ema_context:
+            if self.sharding.shards_parameters:
+                # FSDP2: collective op, all ranks participate; rank 0 gets full state
+                options = StateDictOptions(full_state_dict=True, cpu_offload=True)
+                model_state = get_model_state_dict(self.wrapper, options=options)
+                optim_state = (
+                    get_optimizer_state_dict(
+                        self.wrapper, self.optimizer, options=options
+                    )
+                    if include_optimizer
+                    else None
+                )
+            elif self.sharding.stage == 1:
+                # ZeRO-1: consolidate sharded optimizer state to rank 0.
+                model_state = module.state_dict()
+                if use_ema_weights:
+                    # state_dict() tensors share storage with live parameters; clone
+                    # them before the EMA context restores the original weights.
+                    model_state = deepcopy(model_state)
+                if include_optimizer:
+                    self.optimizer.consolidate_state_dict(to=0)
+                    optim_state = self.optimizer.state_dict() if self.rank == 0 else {}
+                else:
+                    optim_state = None
+            else:
+                model_state = module.state_dict()
+                if use_ema_weights:
+                    # Same storage-sharing issue as zero_stage == 1.
+                    model_state = deepcopy(model_state)
+                optim_state = self.optimizer.state_dict() if include_optimizer else None
+        return model_state, optim_state
+
+    def _write_checkpoint(
+        self,
+        save_path: Path,
+        checkpoint_data: dict[str, Any],
+        *,
+        store: CheckpointStore,
+    ) -> None:
+        """Write a checkpoint file and apply the store's retention policy."""
+        # === Only rank 0 writes to disk ===
+        if self.rank != 0:
+            return
+        optim_state = checkpoint_data.get("optimizer")
+        if optim_state is not None:
+            for item in optim_state["param_groups"]:
+                item["lr"] = float(item["lr"])
+        torch.save(checkpoint_data, save_path)
+        store.prune(save_path)
+
+    def save_model(
+        self,
+        save_path: str | Path,
+        lr: float = 0.0,
+        step: int = 0,
+        *,
+        store: CheckpointStore | None = None,
+        use_ema_weights: bool = False,
+        include_ema_state: bool = True,
+        include_optimizer: bool = True,
+    ) -> None:
+        module = self._get_inner_module()
+        module.train_infos["lr"] = float(lr)
+        module.train_infos["step"] = step
+        model_state, optim_state = self._collect_checkpoint_states(
+            use_ema_weights=use_ema_weights,
+            include_optimizer=include_optimizer,
+        )
+        checkpoint_data: dict[str, Any] = {"model": model_state}
+        if optim_state is not None:
+            checkpoint_data["optimizer"] = optim_state
+        if include_ema_state and self.model_ema is not None and self.rank == 0:
+            checkpoint_data[EMA_CHECKPOINT_KEY] = self.model_ema.state_dict()
+        self._write_checkpoint(
+            Path(save_path),
+            checkpoint_data,
+            store=self.ckpt_store if store is None else store,
+        )
+
+    def save_ema_model(
+        self, save_path: str | Path, lr: float = 0.0, step: int = 0
+    ) -> None:
+        """Save an EMA-weight checkpoint using the regular checkpoint format."""
+        if self.model_ema is None:
+            raise ValueError(
+                "EMA checkpoint saving requires `training.enable_ema=true`."
+            )
+        self.save_model(
+            save_path,
+            lr=lr,
+            step=step,
+            store=self.ema_ckpt_store,
+            use_ema_weights=True,
+            include_ema_state=False,
+            include_optimizer=False,
+        )
+
+    def save_model_merged(
+        self,
+        save_path: str | Path,
+        lr: float = 0.0,
+        step: int = 0,
+        *,
+        store: CheckpointStore | None = None,
+        use_ema_weights: bool = False,
+    ) -> None:
+        """Save a plain SeZM checkpoint with LoRA adapters folded into base weights.
+
+        Behaviour relative to :meth:`save_model`:
+
+        - state_dict: every ``A_by_l`` / ``B_by_l`` / ``A_m0`` / ``B_m0`` /
+          ``A_m.*`` / ``B_m.*`` key is removed; the corresponding ``weight`` /
+          ``weight_m0`` / ``weight_m.*`` tensors absorb ``ΔW = BA·scaling``.
+        - ``_extra_state.model_params``: the ``lora`` entry is stripped (both
+          single-task and multi-task layouts) so the resulting checkpoint
+          loads as plain SeZM without re-triggering LoRA injection.
+        - optimizer state is **not** saved.  Optimizer moments are keyed on
+          LoRA parameters that no longer exist in the merged layout, so
+          resuming training from a merged checkpoint is not supported.
+        - EMA state is **not** saved (this is a deployment snapshot).
+        - The live ``self.wrapper`` / ``optimizer`` / ``model_ema`` are
+          untouched; the fold happens on a detached copy of the state dict.
+
+        Intended use: validator-driven best-topk checkpoint saves for LoRA
+        fine-tune runs.  For plain (non-LoRA) runs the result is bit-level
+        identical to a regular :meth:`save_model` output minus optimizer
+        and EMA state.
+        """
+        module = self._get_inner_module()
+        module.train_infos["lr"] = float(lr)
+        module.train_infos["step"] = step
+        model_state, _ = self._collect_checkpoint_states(
+            use_ema_weights=use_ema_weights,
+            include_optimizer=False,
+        )
+        merged_state = build_merged_state_dict(module, state_dict=model_state)
+        if "_extra_state" in merged_state:
+            merged_state["_extra_state"] = strip_lora_from_extra_state(
+                merged_state["_extra_state"]
+            )
+        self._write_checkpoint(
+            Path(save_path),
+            {"model": merged_state},
+            store=self.ckpt_store if store is None else store,
+        )
+
+    def save_ema_model_merged(
+        self, save_path: str | Path, lr: float = 0.0, step: int = 0
+    ) -> None:
+        """EMA-weight variant of :meth:`save_model_merged`."""
+        if self.model_ema is None:
+            raise ValueError(
+                "EMA checkpoint saving requires `training.enable_ema=true`."
+            )
+        self.save_model_merged(
+            save_path,
+            lr=lr,
+            step=step,
+            store=self.ema_ckpt_store,
+            use_ema_weights=True,
+        )
+
+    def _get_min_pair_dist(self, task_key: str) -> float:
+        """Return the minimum pair distance configured for one task."""
+        if isinstance(self.min_pair_dist, dict):
+            return self.min_pair_dist[task_key]
+        return self.min_pair_dist
+
+    def _next_training_batch(
+        self,
+        task_key: str,
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        """Return the next batch that can produce a synchronized optimizer step.
+
+        Parameters
+        ----------
+        task_key
+            Selected training task.
+
+        Returns
+        -------
+        tuple[dict[str, Any], dict[str, Any], dict[str, Any]]
+            Model inputs, labels, and sampler metadata for a globally valid
+            batch.
+
+        Raises
+        ------
+        RuntimeError
+            If no globally valid batch is found within the synchronized retry
+            budget.
+        """
+        max_attempts = self._training_batch_attempts
+        distributed_filter = (
+            self.has_min_pair_filter and dist.is_available() and dist.is_initialized()
+        )
+
+        for _ in range(max_attempts):
+            batch = self.get_data(is_train=True, task_key=task_key)
+            input_dict = batch[0]
+            globally_valid = bool(input_dict)
+            if distributed_filter:
+                globally_valid = all_ranks_have_valid_frames(globally_valid)
+            if globally_valid:
+                return batch
+            self._discarded_training_batches += 1
+
+        raise RuntimeError(
+            "Unable to collect a globally valid training batch for task "
+            f"{task_key!r} after {max_attempts} attempts with "
+            f"min_pair_dist={self._get_min_pair_dist(task_key)}."
+        )
+
+    def get_data(
+        self, is_train: bool = True, task_key: str = "Default"
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        if is_train:
+            iterator = self.training_data
+        else:
+            iterator = self.validation_data
+        if self.multi_task:
+            iterator = iterator[task_key]
+        if iterator is None:
+            return {}, {}, {}
+        batch_data = next(iterator)
+        # === Filter frames with atoms too close (training only) ===
+        min_pair_dist = self._get_min_pair_dist(task_key)
+        valid_mask = (
+            min_pair_dist_frame_mask(batch_data, min_pair_dist) if is_train else None
+        )
+        local_has_valid = valid_mask is None or bool(torch.any(valid_mask))
+        if not local_has_valid:
+            return {}, {}, {}
+
+        if valid_mask is not None:
+            n_valid = int(valid_mask.sum().item())
+            if n_valid < valid_mask.shape[0]:
+                batch_data = select_batch_frames(batch_data, valid_mask)
+        for key in batch_data.keys():
+            if key == "sid" or key == "fid" or key == "box" or "find_" in key:
+                continue
+            elif not isinstance(batch_data[key], list):
+                if batch_data[key] is not None:
+                    batch_data[key] = batch_data[key].to(DEVICE, non_blocking=True)
+            else:
+                batch_data[key] = [
+                    item.to(DEVICE, non_blocking=True) for item in batch_data[key]
+                ]
+        # we may need a better way to classify which are inputs and which are labels
+        # now wrapper only supports the following inputs:
+        input_keys = [
+            "coord",
+            "atype",
+            "spin",
+            "box",
+            "fparam",
+            "aparam",
+            "charge_spin",
+        ]
+        input_dict = dict.fromkeys(input_keys)
+        label_dict = {}
+        for item_key in batch_data:
+            if item_key in input_keys:
+                if item_key == "fparam" and batch_data.get("find_fparam", 1.0) == 0.0:
+                    continue
+                if (
+                    item_key == "charge_spin"
+                    and batch_data.get("find_charge_spin", 1.0) == 0.0
+                ):
+                    continue
+                input_dict[item_key] = batch_data[item_key]
+            else:
+                if item_key not in ["sid", "fid"]:
+                    label_dict[item_key] = batch_data[item_key]
+        log_dict = {}
+        if "fid" in batch_data:
+            log_dict["fid"] = batch_data["fid"]
+        log_dict["sid"] = batch_data["sid"]
+        return input_dict, label_dict, log_dict
+
+    def print_header(
+        self, fout: Any, train_results: dict[str, Any], valid_results: dict[str, Any]
+    ) -> None:
+        train_keys = sorted(train_results.keys())
+        print_str = ""
+        print_str += "# {:5s}".format("step")
+        if not self.multi_task:
+            if valid_results:
+                prop_fmt = "   %11s %11s"
+                for k in train_keys:
+                    print_str += prop_fmt % (k + "_val", k + "_trn")
+            else:
+                prop_fmt = "   %11s"
+                for k in train_keys:
+                    print_str += prop_fmt % (k + "_trn")
+        else:
+            for model_key in self.model_keys:
+                if valid_results[model_key]:
+                    prop_fmt = "   %11s %11s"
+                    for k in sorted(train_results[model_key].keys()):
+                        print_str += prop_fmt % (
+                            k + f"_val_{model_key}",
+                            k + f"_trn_{model_key}",
+                        )
+                else:
+                    prop_fmt = "   %11s"
+                    for k in sorted(train_results[model_key].keys()):
+                        print_str += prop_fmt % (k + f"_trn_{model_key}")
+        print_str += "   {:8s}\n".format("lr")
+        print_str += "# If there is no available reference data, rmse_*_{val,trn} will print nan\n"
+        fout.write(print_str)
+        fout.flush()
+
+    def print_on_training(
+        self,
+        fout: Any,
+        step_id: int,
+        cur_lr: float,
+        train_results: dict,
+        valid_results: dict,
+    ) -> None:
+        train_keys = sorted(train_results.keys())
+        print_str = ""
+        print_str += f"{step_id:7d}"
+        if not self.multi_task:
+            if valid_results:
+                prop_fmt = "   %11.2e %11.2e"
+                for k in train_keys:
+                    print_str += prop_fmt % (valid_results[k], train_results[k])
+            else:
+                prop_fmt = "   %11.2e"
+                for k in train_keys:
+                    print_str += prop_fmt % (train_results[k])
+        else:
+            for model_key in self.model_keys:
+                if valid_results[model_key]:
+                    prop_fmt = "   %11.2e %11.2e"
+                    for k in sorted(valid_results[model_key].keys()):
+                        print_str += prop_fmt % (
+                            valid_results[model_key][k],
+                            train_results[model_key][k],
+                        )
+                else:
+                    prop_fmt = "   %11.2e"
+                    for k in sorted(train_results[model_key].keys()):
+                        print_str += prop_fmt % (train_results[model_key][k])
+        print_str += f"   {cur_lr:8.1e}\n"
+        fout.write(print_str)
+        fout.flush()
+
+
+def all_ranks_have_valid_frames(local_has_valid: bool) -> bool:
+    """
+    Return whether every distributed rank has a valid training frame.
+
+    Parameters
+    ----------
+    local_has_valid
+        Whether the current rank has at least one valid frame.
+
+    Returns
+    -------
+    bool
+        ``True`` only when every rank reports a valid frame.
+    """
+    all_ranks_have_valid = torch.tensor(
+        int(local_has_valid),
+        dtype=torch.int32,
+        device=DEVICE,
+    )
+    dist.all_reduce(all_ranks_have_valid, op=dist.ReduceOp.MIN)
+    return bool(all_ranks_have_valid.item())
+
+
+def get_additional_data_requirement(_model: Any) -> list[DataRequirementItem]:
+    additional_data_requirement = []
+    if _model.get_dim_fparam() > 0:
+        _fparam_default = (
+            _model.get_default_fparam().cpu().numpy()
+            if _model.has_default_fparam()
+            else 0.0
+        )
+        fparam_requirement_items = [
+            DataRequirementItem(
+                "fparam",
+                _model.get_dim_fparam(),
+                atomic=False,
+                must=not _model.has_default_fparam(),
+                default=_fparam_default,
+                source_policy=("default" if _model.has_default_fparam() else "tracked"),
+            )
+        ]
+        additional_data_requirement += fparam_requirement_items
+    if _model.get_dim_aparam() > 0:
+        aparam_requirement_items = [
+            DataRequirementItem(
+                "aparam", _model.get_dim_aparam(), atomic=True, must=True
+            )
+        ]
+        additional_data_requirement += aparam_requirement_items
+    has_spin = getattr(_model, "has_spin", False)
+    if callable(has_spin):
+        has_spin = has_spin()
+    if has_spin:
+        # ``model.spin.allow_missing_label`` relaxes the spin label from mandatory to
+        # optional with a zero default, so a system without a ``spin`` file is filled
+        # with zeros rather than rejected. The flag is read from the model's spin
+        # configuration.
+        allow_missing_spin = getattr(
+            getattr(_model, "spin", None), "allow_missing_label", False
+        )
+        spin_requirement_items = [
+            DataRequirementItem(
+                "spin",
+                ndof=3,
+                atomic=True,
+                must=not allow_missing_spin,
+                default=0.0,
+                source_policy="default" if allow_missing_spin else "tracked",
+            )
+        ]
+        additional_data_requirement += spin_requirement_items
+    if _model.has_chg_spin_ebd():
+        has_default_cs = _model.has_default_chg_spin()
+        cs_default = (
+            _model.get_default_chg_spin().cpu().numpy() if has_default_cs else 0.0
+        )
+        additional_data_requirement.append(
+            DataRequirementItem(
+                "charge_spin",
+                ndof=2,
+                atomic=False,
+                must=not has_default_cs,
+                default=cs_default,
+                source_policy="default" if has_default_cs else "tracked",
+            )
+        )
+    return additional_data_requirement
+
+
+def prepare_model_for_loss(
+    model: Any,
+    loss_params: dict[str, Any] | None,
+) -> None:
+    """Align model execution mode with the configured training loss."""
+    if loss_params is None:
+        return
+    if isinstance(model, dict):
+        for model_key, sub_model in model.items():
+            sub_loss = loss_params.get(model_key)
+            if sub_loss is not None:
+                prepare_model_for_loss(sub_model, sub_loss)
+        return
+    if hasattr(model, "set_active_mode_from_loss"):
+        loss_type = loss_params.get("type", "ener")
+        model.set_active_mode_from_loss(
+            "ener" if loss_type == "ener_hess" else loss_type
+        )
+
+
+def prepare_model_for_data_requirements(
+    model: Any,
+    data_requirements: list[DataRequirementItem] | dict[str, list[DataRequirementItem]],
+    model_params: dict[str, Any],
+) -> None:
+    """Enable model outputs requested by a loss's data requirements.
+
+    Hessian prefactors are deliberately not inspected here. The presence of a
+    ``hessian`` requirement is the loss-to-trainer contract for enabling that
+    expensive output. The mode is persisted in the model definition so reload
+    and freeze paths reconstruct the same model interface.
+    """
+    if isinstance(model, dict):
+        if not isinstance(data_requirements, dict):
+            raise TypeError("Multi-task models require per-task data requirements.")
+        for model_key, sub_model in model.items():
+            prepare_model_for_data_requirements(
+                sub_model,
+                data_requirements[model_key],
+                model_params["model_dict"][model_key],
+            )
+        return
+    if isinstance(data_requirements, dict):
+        raise TypeError("Single-task models require a list of data requirements.")
+    if not has_data_requirement(data_requirements, "hessian"):
+        return
+    enable_hessian = getattr(model, "enable_hessian", None)
+    if not callable(enable_hessian):
+        raise RuntimeError(
+            f"Model {type(model).__name__} does not support Hessian supervision."
+        )
+    enable_hessian()
+    model_params["hessian_mode"] = True
+    if hasattr(model, "model_def_script"):
+        model.model_def_script = json.dumps(model_params)
+
+
+def get_loss(
+    loss_params: dict[str, Any], start_lr: float, _ntypes: int, _model: Any
+) -> TaskLoss:
+    loss_type = loss_params.get("type", "ener")
+    if loss_type in {"ener", "ener_hess"}:
+        loss_params["starter_learning_rate"] = start_lr
+        return EnergyStdLoss(**loss_params)
+    elif loss_type == "dens":
+        loss_params["starter_learning_rate"] = start_lr
+        return DeNSLoss(**loss_params)
+    elif loss_type == "dos":
+        loss_params["starter_learning_rate"] = start_lr
+        loss_params["numb_dos"] = _model.model_output_def()["dos"].output_size
+        return DOSLoss(**loss_params)
+    elif loss_type == "ener_spin":
+        loss_params["starter_learning_rate"] = start_lr
+        return EnergySpinLoss(**loss_params)
+    elif loss_type == "tensor":
+        model_output_type = _model.model_output_type()
+        if "mask" in model_output_type:
+            model_output_type.pop(model_output_type.index("mask"))
+        tensor_name = model_output_type[0]
+        loss_params["tensor_size"] = _model.model_output_def()[tensor_name].output_size
+        loss_params["label_name"] = tensor_name
+        if tensor_name == "polarizability":
+            tensor_name = "polar"
+        loss_params["tensor_name"] = tensor_name
+        return TensorLoss(**loss_params)
+    elif loss_type == "property":
+        task_dim = _model.get_task_dim()
+        var_name = _model.get_var_name()
+        intensive = _model.get_intensive()
+        loss_params["task_dim"] = task_dim
+        loss_params["var_name"] = var_name
+        loss_params["intensive"] = intensive
+        return PropertyLoss(**loss_params)
+    elif loss_type == "population":
+        loss_params["starter_learning_rate"] = start_lr
+        return PopulationLoss(**loss_params)
+
+    else:
+        loss_params["starter_learning_rate"] = start_lr
+        return TaskLoss.get_class_by_type(loss_type).get_loss(loss_params)
+
+
+def get_single_model(
+    _model_params: dict[str, Any],
+) -> Any:
+    if "use_srtab" in _model_params:
+        model = get_zbl_model(deepcopy(_model_params)).to(DEVICE)
+    else:
+        model = get_model(deepcopy(_model_params)).to(DEVICE)
+    return model
+
+
+def get_model_for_wrapper(
+    _model_params: dict[str, Any],
+    resuming: bool = False,
+) -> Any:
+    if "model_dict" not in _model_params:
+        _model = get_single_model(
+            _model_params,
+        )
+    else:
+        _model = {}
+        model_keys = list(_model_params["model_dict"])
+        do_case_embd, case_embd_index = get_case_embd_config(_model_params)
+        for _model_key in model_keys:
+            _model[_model_key] = get_single_model(
+                _model_params["model_dict"][_model_key],
+            )
+            if do_case_embd and not resuming:
+                # only set case_embd when from scratch multitask training
+                _model[_model_key].set_case_embd(case_embd_index[_model_key])
+    return _model
+
+
+def get_case_embd_config(_model_params: dict[str, Any]) -> tuple[bool, dict[str, int]]:
+    assert "model_dict" in _model_params, (
+        "Only support setting case embedding for multi-task model!"
+    )
+    model_keys = list(_model_params["model_dict"])
+    sorted_model_keys = sorted(model_keys)
+    numb_case_embd_list = [
+        _model_params["model_dict"][model_key]
+        .get("fitting_net", {})
+        .get("dim_case_embd", 0)
+        for model_key in sorted_model_keys
+    ]
+    if not all(item == numb_case_embd_list[0] for item in numb_case_embd_list):
+        raise ValueError(
+            f"All models must have the same dimension of case embedding, while the settings are: {numb_case_embd_list}"
+        )
+    if numb_case_embd_list[0] == 0:
+        return False, {}
+    case_embd_index = {
+        model_key: idx for idx, model_key in enumerate(sorted_model_keys)
+    }
+    return True, case_embd_index
+
+
+def model_change_out_bias(
+    _model: Any,
+    _sample_func: Callable[[], Any],
+    _bias_adjust_mode: str = "change-by-statistic",
+) -> Any:
+    from deepmd.pt.model.model.dp_model import (
+        DPModelCommon,
+    )
+
+    return change_model_out_bias(
+        _model,
+        _sample_func,
+        bias_adjust_mode=_bias_adjust_mode,
+        recompute_input_stats=isinstance(_model, DPModelCommon),
+    )

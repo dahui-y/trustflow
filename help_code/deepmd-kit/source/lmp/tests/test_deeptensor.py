@@ -1,0 +1,134 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
+import os
+from pathlib import (
+    Path,
+)
+
+import constants
+import numpy as np
+import pytest
+from lammps import (
+    PyLammps,
+)
+from lammps_test_utils import (
+    make_atomic_lammps,
+)
+from model_convert import (
+    ensure_converted_pb,
+)
+from write_lmp_data import (
+    write_lmp_data,
+)
+
+pbtxt_file = Path(__file__).parent.parent.parent / "tests" / "infer" / "deeppot.pbtxt"
+pb_file = Path(__file__).parent / "graph.pb"
+pbtxt_file2 = (
+    Path(__file__).parent.parent.parent / "tests" / "infer" / "deepdipole_new.pbtxt"
+)
+pb_file2 = Path(__file__).parent / "deepdipole_new.pb"
+system_file = Path(__file__).parent.parent.parent / "tests"
+data_file = Path(__file__).parent / "data.lmp"
+data_file_si = Path(__file__).parent / "data.si"
+data_type_map_file = Path(__file__).parent / "data_type_map.lmp"
+
+# this is as the same as python and c++ tests, test_deepdipole.py
+expected_d = np.array(
+    [
+        -1.128427726201255282e-01,
+        2.654103846999197880e-01,
+        2.625816377288122533e-02,
+        3.027556488877700680e-01,
+        -7.475444785689989990e-02,
+        1.526291164572509684e-01,
+    ]
+)
+# sel_type is 0, it seems that it works here
+expected_d[[1, 2, 4, 5]] = 0.0
+box = np.array([0, 13, 0, 13, 0, 13, 0, 0, 0])
+coord = np.array(
+    [
+        [12.83, 2.56, 2.18],
+        [12.09, 2.87, 2.74],
+        [0.25, 3.32, 1.68],
+        [3.36, 3.00, 1.81],
+        [3.51, 2.51, 2.60],
+        [4.27, 3.22, 1.56],
+    ]
+)
+type_OH = np.array([1, 2, 2, 1, 2, 2])
+# TODO
+# type_HO = np.array([2, 1, 1, 2, 1, 1])
+
+
+def setup_module() -> None:
+    if os.environ.get("ENABLE_TENSORFLOW", "1") != "1":
+        pytest.skip(
+            "Skip test because TensorFlow support is not enabled.",
+        )
+    ensure_converted_pb(pbtxt_file, pb_file)
+    ensure_converted_pb(pbtxt_file2, pb_file2)
+
+    write_lmp_data(box, coord, type_OH, data_file)
+    # TODO
+    # write_lmp_data(box, coord, type_HO, data_type_map_file)
+    write_lmp_data(
+        box * constants.dist_metal2si,
+        coord * constants.dist_metal2si,
+        type_OH,
+        data_file_si,
+    )
+
+
+def teardown_module() -> None:
+    os.remove(data_file)
+    # os.remove(data_type_map_file)
+    os.remove(data_file_si)
+
+
+def _lammps(data_file, units="metal") -> PyLammps:
+    return make_atomic_lammps(data_file, units)
+
+
+@pytest.fixture
+def lammps():
+    lmp = _lammps(data_file=data_file)
+    yield lmp
+    lmp.close()
+
+
+# @pytest.fixture
+# def lammps_type_map():
+#    yield _lammps(data_file=data_type_map_file)
+
+
+@pytest.fixture
+def lammps_si():
+    lmp = _lammps(data_file=data_file_si, units="si")
+    yield lmp
+    lmp.close()
+
+
+def test_compute_deeptensor_atom(lammps) -> None:
+    lammps.pair_style(f"deepmd {pb_file.resolve()}")
+    lammps.pair_coeff("* *")
+    lammps.compute(f"tensor all deeptensor/atom {pb_file2.resolve()}")
+    lammps.variable("tensor atom c_tensor[1]")
+    lammps.dump("1 all custom 1 dump id c_tensor[1]")
+    lammps.run(0)
+    idx_map = lammps.lmp.numpy.extract_atom("id")[: coord.shape[0]] - 1
+    assert np.array(lammps.variables["tensor"].value) == pytest.approx(
+        expected_d[idx_map]
+    )
+
+
+def test_compute_deeptensor_atom_si(lammps_si) -> None:
+    lammps_si.pair_style(f"deepmd {pb_file.resolve()}")
+    lammps_si.pair_coeff("* *")
+    lammps_si.compute(f"tensor all deeptensor/atom {pb_file2.resolve()}")
+    lammps_si.variable("tensor atom c_tensor[1]")
+    lammps_si.dump("1 all custom 1 dump id c_tensor[1]")
+    lammps_si.run(0)
+    idx_map = lammps_si.lmp.numpy.extract_atom("id")[: coord.shape[0]] - 1
+    assert np.array(lammps_si.variables["tensor"].value) == pytest.approx(
+        expected_d[idx_map] * constants.dist_metal2si
+    )

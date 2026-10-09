@@ -1,0 +1,105 @@
+{
+  "_comment": "Compact DPA4/SeZM water checkpoint used by the LAMMPS smoke test.",
+  "model": {
+    "type": "dpa4",
+    "type_map": [
+      "O",
+      "H"
+    ],
+    "descriptor": {
+      "rcut": 6.0,
+      "channels": 16,
+      "n_radial": 6,
+      "edge_norm": false,
+      "use_env_seed": true,
+      "lmax": 1,
+      "mmax": 1,
+      "n_blocks": 1,
+      "mixing_layers": 2,
+      "radial_so2_mode": "none",
+      "n_focus": 1,
+      "focus_dim": 0,
+      "n_atten_head": 1,
+      "message_node_so3": false,
+      "ffn_neurons": 0,
+      "ffn_so3_grid": false,
+      "grid_mlp": false,
+      "grid_branch": 0,
+      "ffn_blocks": 1,
+      "so3_readout": "none",
+      "use_amp": true,
+      "precision": "float32",
+      "seed": 42
+    },
+    "fitting_net": {
+      "neuron": [
+        0
+      ],
+      "precision": "float32",
+      "seed": 42
+    },
+    "use_compile": false,
+    "enable_tf32": true
+  },
+  "learning_rate": {
+    "type": "wsd",
+    "start_lr": 0.0005,
+    "stop_lr": 1e-06,
+    "warmup_ratio": 0.003,
+    "warmup_start_factor": 0.2,
+    "decay_phase_ratio": 0.65,
+    "decay_type": "cosine"
+  },
+  "loss": {
+    "type": "ener",
+    "loss_func": "mae",
+    "f_use_norm": true,
+    "start_pref_e": 20,
+    "limit_pref_e": 20,
+    "start_pref_f": 20,
+    "limit_pref_f": 20,
+    "start_pref_v": 0,
+    "limit_pref_v": 0
+  },
+  "optimizer": {
+    "type": "HybridMuon",
+    "muon_mode": "slice",
+    "enable_gram": true,
+    "magma_muon": true,
+    "lr_adjust": 0.0,
+    "weight_decay": 0.001
+  },
+  "training": {
+    "training_data": {
+      "systems": [
+        "../../data/data_0",
+        "../../data/data_1",
+        "../../data/data_2"
+      ],
+      "batch_size": 1
+    },
+    "validation_data": {
+      "systems": [
+        "../../data/data_3"
+      ],
+      "batch_size": 1,
+      "numb_btch": 1
+    },
+    "numb_steps": 500,
+    "gradient_max_norm": 5.0,
+    "save_freq": 500,
+    "max_ckpt_keep": 1,
+    "enable_ema": false,
+    "disp_file": "lcurve.out",
+    "disp_freq": 100,
+    "disp_avg": true,
+    "disp_training": true,
+    "time_training": false,
+    "seed": 7
+  },
+  "validating": {
+    "full_validation": false,
+    "ema_full_validation": false,
+    "validation_freq": 100
+  }
+}

@@ -1,0 +1,391 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
+"""Unit tests for the pt_expt EnergySpinLoss wrapper."""
+
+import numpy as np
+import pytest
+import torch
+
+from deepmd.dpmodel.loss.ener_spin import EnergySpinLoss as EnergySpinLossDP
+from deepmd.pt_expt.loss.ener_spin import (
+    EnergySpinLoss,
+)
+from deepmd.pt_expt.utils import (
+    env,
+)
+from deepmd.pt_expt.utils.env import (
+    PRECISION_DICT,
+)
+
+from ...pt.model.test_mlp import (
+    get_tols,
+)
+from ...seed import (
+    GLOBAL_SEED,
+)
+
+
+def _make_data(
+    rng: np.random.Generator,
+    nframes: int,
+    natoms: int,
+    n_magnetic: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    """Build model prediction and label dicts as torch tensors."""
+    # mask_mag: True for magnetic atoms, False otherwise
+    mask_mag = torch.zeros((nframes, natoms, 1), dtype=torch.bool, device=device)
+    mask_mag[:, :n_magnetic, :] = True
+    model_pred = {
+        "energy": torch.tensor(rng.random((nframes,)), dtype=dtype, device=device),
+        "force": torch.tensor(
+            rng.random((nframes, natoms, 3)), dtype=dtype, device=device
+        ),
+        "force_mag": torch.tensor(
+            rng.random((nframes, natoms, 3)), dtype=dtype, device=device
+        ),
+        "mask_mag": mask_mag,
+        "virial": torch.tensor(rng.random((nframes, 9)), dtype=dtype, device=device),
+        "atom_energy": torch.tensor(
+            rng.random((nframes, natoms)), dtype=dtype, device=device
+        ),
+    }
+    label = {
+        "energy": torch.tensor(rng.random((nframes,)), dtype=dtype, device=device),
+        "force": torch.tensor(
+            rng.random((nframes, natoms, 3)), dtype=dtype, device=device
+        ),
+        "force_mag": torch.tensor(
+            rng.random((nframes, natoms, 3)), dtype=dtype, device=device
+        ),
+        "virial": torch.tensor(rng.random((nframes, 9)), dtype=dtype, device=device),
+        "atom_ener": torch.tensor(
+            rng.random((nframes, natoms)), dtype=dtype, device=device
+        ),
+        "find_energy": torch.tensor(1.0, dtype=dtype, device=device),
+        "find_force": torch.tensor(1.0, dtype=dtype, device=device),
+        "find_force_mag": torch.tensor(1.0, dtype=dtype, device=device),
+        "find_virial": torch.tensor(1.0, dtype=dtype, device=device),
+        "find_atom_ener": torch.tensor(1.0, dtype=dtype, device=device),
+    }
+    return model_pred, label
+
+
+class TestEnergySpinLoss:
+    def setup_method(self) -> None:
+        self.device = env.DEVICE
+
+    @pytest.mark.parametrize("prec", ["float64", "float32"])  # precision
+    @pytest.mark.parametrize("loss_func", ["mse", "mae"])  # loss function
+    def test_consistency(self, prec, loss_func) -> None:
+        """Construct -> forward -> serialize/deserialize -> forward -> compare.
+
+        Also compare with dpmodel.
+        """
+        rng = np.random.default_rng(GLOBAL_SEED)
+        nframes, natoms, n_magnetic = 2, 6, 4
+        dtype = PRECISION_DICT[prec]
+        rtol, atol = get_tols(prec)
+        if prec in ["single", "float32"]:
+            atol = max(atol, 2e-4)  # relax for float32 rounding across envs
+        learning_rate = 1e-3
+
+        loss0 = EnergySpinLoss(
+            starter_learning_rate=1e-3,
+            start_pref_e=0.02,
+            limit_pref_e=1.0,
+            start_pref_fr=1000.0,
+            limit_pref_fr=1.0,
+            start_pref_fm=1000.0,
+            limit_pref_fm=1.0,
+            start_pref_v=1.0,
+            limit_pref_v=1.0,
+            start_pref_ae=1.0,
+            limit_pref_ae=1.0,
+            loss_func=loss_func,
+        )
+
+        model_pred, label = _make_data(
+            rng, nframes, natoms, n_magnetic, dtype, self.device
+        )
+
+        # Forward
+        l0, more0 = loss0(learning_rate, natoms, model_pred, label)
+        assert l0.shape == ()
+        assert "rmse" in more0
+
+        # Serialize / deserialize round-trip
+        loss1 = EnergySpinLoss.deserialize(loss0.serialize())
+        l1, more1 = loss1(learning_rate, natoms, model_pred, label)
+
+        np.testing.assert_allclose(
+            l0.detach().cpu().numpy(),
+            l1.detach().cpu().numpy(),
+            rtol=rtol,
+            atol=atol,
+        )
+        for key in more0:
+            np.testing.assert_allclose(
+                more0[key].detach().cpu().numpy(),
+                more1[key].detach().cpu().numpy(),
+                rtol=rtol,
+                atol=atol,
+                err_msg=f"key={key}",
+            )
+
+        # Compare with dpmodel (numpy)
+        dp_loss = EnergySpinLossDP.deserialize(loss0.serialize())
+        model_pred_np = {
+            k: v.detach().cpu().numpy() if isinstance(v, torch.Tensor) else v
+            for k, v in model_pred.items()
+        }
+        label_np = {
+            k: v.detach().cpu().numpy() if isinstance(v, torch.Tensor) else v
+            for k, v in label.items()
+        }
+        l_dp, _more_dp = dp_loss(learning_rate, natoms, model_pred_np, label_np)
+
+        np.testing.assert_allclose(
+            l0.detach().cpu().numpy(),
+            np.array(l_dp),
+            rtol=rtol,
+            atol=atol,
+            err_msg="pt_expt vs dpmodel",
+        )
+
+    @pytest.mark.parametrize("prec", ["float64", "float32"])  # precision
+    def test_partial_mask(self, prec) -> None:
+        """Test with partial magnetic atoms (some atoms non-magnetic)."""
+        rng = np.random.default_rng(GLOBAL_SEED + 1)
+        nframes, natoms, n_magnetic = 2, 6, 2
+        dtype = PRECISION_DICT[prec]
+        rtol, atol = get_tols(prec)
+        learning_rate = 1e-3
+
+        loss0 = EnergySpinLoss(
+            starter_learning_rate=1e-3,
+            start_pref_e=0.02,
+            limit_pref_e=1.0,
+            start_pref_fr=1000.0,
+            limit_pref_fr=1.0,
+            start_pref_fm=1000.0,
+            limit_pref_fm=1.0,
+            start_pref_v=0.0,
+            limit_pref_v=0.0,
+            start_pref_ae=0.0,
+            limit_pref_ae=0.0,
+        )
+
+        model_pred, label = _make_data(
+            rng, nframes, natoms, n_magnetic, dtype, self.device
+        )
+
+        l0, more0 = loss0(learning_rate, natoms, model_pred, label)
+        assert l0.shape == ()
+        assert "rmse_fm" in more0
+
+        # Compare with dpmodel
+        dp_loss = EnergySpinLossDP.deserialize(loss0.serialize())
+        model_pred_np = {
+            k: v.detach().cpu().numpy() if isinstance(v, torch.Tensor) else v
+            for k, v in model_pred.items()
+        }
+        label_np = {
+            k: v.detach().cpu().numpy() if isinstance(v, torch.Tensor) else v
+            for k, v in label.items()
+        }
+        l_dp, _ = dp_loss(learning_rate, natoms, model_pred_np, label_np)
+
+        np.testing.assert_allclose(
+            l0.detach().cpu().numpy(),
+            np.array(l_dp),
+            rtol=rtol,
+            atol=atol,
+            err_msg="pt_expt vs dpmodel (partial mask)",
+        )
+
+    @pytest.mark.parametrize("prec", ["float64", "float32"])  # precision
+    def test_all_masked(self, prec) -> None:
+        """Test with all atoms magnetic."""
+        rng = np.random.default_rng(GLOBAL_SEED + 2)
+        nframes, natoms, n_magnetic = 2, 6, 6
+        dtype = PRECISION_DICT[prec]
+        rtol, atol = get_tols(prec)
+        learning_rate = 1e-3
+
+        loss0 = EnergySpinLoss(
+            starter_learning_rate=1e-3,
+            start_pref_e=0.0,
+            limit_pref_e=0.0,
+            start_pref_fr=0.0,
+            limit_pref_fr=0.0,
+            start_pref_fm=1000.0,
+            limit_pref_fm=1.0,
+            start_pref_v=0.0,
+            limit_pref_v=0.0,
+            start_pref_ae=0.0,
+            limit_pref_ae=0.0,
+        )
+
+        model_pred, label = _make_data(
+            rng, nframes, natoms, n_magnetic, dtype, self.device
+        )
+
+        l0, _more0 = loss0(learning_rate, natoms, model_pred, label)
+        assert l0.shape == ()
+
+        # Compare with dpmodel
+        dp_loss = EnergySpinLossDP.deserialize(loss0.serialize())
+        model_pred_np = {
+            k: v.detach().cpu().numpy() if isinstance(v, torch.Tensor) else v
+            for k, v in model_pred.items()
+        }
+        label_np = {
+            k: v.detach().cpu().numpy() if isinstance(v, torch.Tensor) else v
+            for k, v in label.items()
+        }
+        l_dp, _ = dp_loss(learning_rate, natoms, model_pred_np, label_np)
+
+        np.testing.assert_allclose(
+            l0.detach().cpu().numpy(),
+            np.array(l_dp),
+            rtol=rtol,
+            atol=atol,
+            err_msg="pt_expt vs dpmodel (all masked)",
+        )
+
+    @pytest.mark.parametrize("prec", ["float64", "float32"])
+    @pytest.mark.parametrize("loss_func", ["mse", "mae"])
+    def test_no_magnetic_atoms(self, prec, loss_func) -> None:
+        """An all-false magnetic mask has a finite zero contribution.
+
+        This complements the backend-neutral NumPy regression by exercising the
+        same dpmodel implementation through the Torch Array API namespace.
+        """
+        rng = np.random.default_rng(GLOBAL_SEED + 3)
+        nframes, natoms = 2, 6
+        dtype = PRECISION_DICT[prec]
+        learning_rate = 1e-3
+        loss_fn = EnergySpinLoss(
+            starter_learning_rate=learning_rate,
+            start_pref_fm=1.0,
+            limit_pref_fm=1.0,
+            loss_func=loss_func,
+        )
+        model_pred, label = _make_data(rng, nframes, natoms, 0, dtype, self.device)
+
+        loss, more_loss = loss_fn(
+            learning_rate,
+            natoms,
+            model_pred,
+            label,
+            mae=True,
+        )
+        assert torch.isfinite(loss)
+        torch.testing.assert_close(loss, torch.zeros_like(loss))
+        torch.testing.assert_close(
+            more_loss["mae_fm"], torch.zeros_like(more_loss["mae_fm"])
+        )
+        torch.testing.assert_close(
+            more_loss["rmse"], torch.zeros_like(more_loss["rmse"])
+        )
+        if loss_func == "mse":
+            torch.testing.assert_close(
+                more_loss["rmse_fm"], torch.zeros_like(more_loss["rmse_fm"])
+            )
+
+    @pytest.mark.parametrize("loss_func", ["mse", "mae"])
+    def test_ragged_matches_masked_rectangular(self, loss_func: str) -> None:
+        """Every spin-loss term is invariant to padding the node axis."""
+        dtype = torch.float64
+        device = self.device
+        n_node = torch.tensor([3, 2], dtype=torch.int64, device=device)
+        real_atom = torch.tensor(
+            [[True, True, True], [True, True, False]], device=device
+        )
+
+        def padded(values: torch.Tensor, fill: float = 0.0) -> torch.Tensor:
+            result = torch.full(
+                (2, 3, *values.shape[1:]), fill, dtype=dtype, device=device
+            )
+            result[real_atom] = values
+            return result
+
+        atom_energy = torch.arange(1, 6, dtype=dtype, device=device).reshape(-1, 1)
+        force = torch.arange(15, dtype=dtype, device=device).reshape(-1, 3) / 10.0
+        force_mag = force + 0.25
+        atom_coeff = torch.tensor(
+            [[1.0], [0.5], [-0.5], [2.0], [1.5]], dtype=dtype, device=device
+        )
+        magnetic = torch.tensor(
+            [[True], [False], [True], [False], [True]], device=device
+        )
+        model_rect = {
+            "energy": torch.zeros((2, 1), dtype=dtype, device=device),
+            "force": padded(force),
+            "force_mag": padded(force_mag),
+            "mask_mag": padded(magnetic.to(dtype), fill=1.0).bool(),
+            "virial": torch.arange(18, dtype=dtype, device=device).reshape(2, 9),
+            "atom_energy": padded(atom_energy, fill=100.0),
+            "mask": real_atom.to(dtype),
+        }
+        label_rect = {
+            "energy": torch.tensor([[1.0], [2.0]], dtype=dtype, device=device),
+            "force": padded(force + 0.5, fill=100.0),
+            "force_mag": padded(force_mag - 0.5, fill=100.0),
+            "virial": model_rect["virial"] + 0.5,
+            "atom_ener": padded(atom_energy - 0.25, fill=100.0),
+            "atom_ener_coeff": padded(atom_coeff, fill=3.0),
+            "find_energy": 1.0,
+            "find_force": 1.0,
+            "find_force_mag": 1.0,
+            "find_virial": 1.0,
+            "find_atom_ener": 1.0,
+        }
+        model_ragged = {
+            "energy": model_rect["energy"],
+            "force": force,
+            "force_mag": force_mag,
+            "mask_mag": magnetic,
+            "virial": model_rect["virial"],
+            "atom_energy": atom_energy,
+            "mask": torch.ones(5, dtype=dtype, device=device),
+            "n_node": n_node,
+        }
+        label_ragged = {
+            "energy": label_rect["energy"],
+            "force": force + 0.5,
+            "force_mag": force_mag - 0.5,
+            "virial": label_rect["virial"],
+            "atom_ener": atom_energy - 0.25,
+            "atom_ener_coeff": atom_coeff,
+            "find_energy": 1.0,
+            "find_force": 1.0,
+            "find_force_mag": 1.0,
+            "find_virial": 1.0,
+            "find_atom_ener": 1.0,
+        }
+        loss_fn = EnergySpinLoss(
+            starter_learning_rate=1.0,
+            start_pref_e=1.0,
+            limit_pref_e=1.0,
+            start_pref_fr=1.0,
+            limit_pref_fr=1.0,
+            start_pref_fm=1.0,
+            limit_pref_fm=1.0,
+            start_pref_v=1.0,
+            limit_pref_v=1.0,
+            start_pref_ae=1.0,
+            limit_pref_ae=1.0,
+            enable_atom_ener_coeff=True,
+            loss_func=loss_func,
+            intensive_ener_virial=True,
+        )
+
+        rectangular_loss, rectangular_more = loss_fn(1.0, 3, model_rect, label_rect)
+        ragged_loss, ragged_more = loss_fn(1.0, 5, model_ragged, label_ragged)
+
+        torch.testing.assert_close(ragged_loss, rectangular_loss)
+        assert ragged_more.keys() == rectangular_more.keys()
+        for key in ragged_more:
+            torch.testing.assert_close(ragged_more[key], rectangular_more[key])

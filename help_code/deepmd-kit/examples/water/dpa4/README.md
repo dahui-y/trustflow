@@ -1,0 +1,28 @@
+# DPA4/SeZM water examples
+
+This directory contains PyTorch input files for training DPA4/SeZM on the
+water example dataset. The recommended model and descriptor type is `DPA4`;
+`dpa4`, `SeZM`, and `sezm` are accepted aliases for the same implementation.
+
+Input files:
+
+- `input.json`: baseline conservative energy training, using a compact
+  DPA4-Mini-style parameter set.
+- `input_preset.json`: energy training with the model architecture taken from
+  the named preset `dpa4-nano-v20260911` instead of being written out.
+- `input-zbl.json`: energy training with ZBL zone bridging.
+- `input_dens.json`: direct-force denoising training.
+- `input_multitask.json`: multitask training with a shared descriptor and
+  case-conditioned shared fitting network.
+- `input_multitask_preset.json`: the same multitask training with the shared
+  descriptor and fitting network taken from the named preset
+  `dpa4-nano-v20260911`.
+- `lora_ft.json`: LoRA fine-tuning.
+- `lmp/`: compact checkpoint and LAMMPS smoke-test files.
+
+Run:
+
+```bash
+cd examples/water/dpa4
+dp --pt train input.json
+```
