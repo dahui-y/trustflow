@@ -313,6 +313,15 @@ desc, atom_feat, struct_feat = dp.eval_embedding(coords, cells, atom_types)
 
 两者通过 `consolidated_gen_trajectory.pt`（纯 torch tensor dict）衔接，不共享任何 Python 包。`flowmm` 环境自带的 chgnet 0.3.1 也可以直接做 Exp A，但 DPA 需要新 torch，所以 Exp B 必然要第二个环境。
 
+**实际建环境时踩到的坑（2026-10-09，RTX 4090 / 驱动 580 / conda 24）**
+
+1. fork 丢失了子模块 gitlink，已用 `git submodule add` 重新注册并改为 https 地址。
+2. `data/*.csv` 的 LFS 对象不在 fork 的 LFS 服务器上。`help_code/DiffCSP/data/mp_20/*.csv` 与指针 sha256 完全一致，直接 `cp` 过来，然后 `git update-index --assume-unchanged data/mp_20/*.csv` 防止误提交。
+3. `remote/riemannian-fm/manifm/` 没有 `__init__.py`，新版 pip 的 editable 安装注册为空包。修法：把该目录写进 site-packages 的 `manifm.pth`。
+4. conda 装的 Pillow 链接 `libtiff.so.5` 失败，`pip install --force-reinstall --no-deps pillow` 解决。
+5. 直接 `from manifm.solvers import ...` 会触发 manifm 内部循环 import，FlowMM 自身的 import 顺序不会触发，验证环境时用 `from flowmm.model.model_pl import MaterialsRFMLitModule`。
+6. pip 阶段把 pymatgen 升到 2024.8.9（matbench-discovery 拉的），暂未见问题。
+
 **在当前仓库跑通 FlowMM 之前必须做的事**（这些不是 TrustFlow 代码）：
 
 1. `git submodule update --init`（`.gitmodules` 用的是 `git@github.com:` SSH 地址，需改为 https 或配置 SSH）。
