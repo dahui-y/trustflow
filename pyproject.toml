@@ -10,6 +10,9 @@ version-file = "src/flowmm/_version.py"
 
 [tool.hatch.metadata.hooks.vcs]
 
+[tool.hatch.build.targets.wheel]
+packages = ["src/flowmm", "src/trustflow"]
+
 [project]
 name = "flowmm"
 authors = [
