@@ -143,6 +143,72 @@ Claude Code 在后续开发过程中必须遵循一个原则：
 
 ---
 
+## Milestone 0 — Application Preliminary Study（申请前唯一里程碑）
+
+**原则：申请前不实现 TrustFlow 整体，只建立"这个问题值得研究"的 preliminary evidence。工作量控制在约 3–7 天。**
+
+申请前只回答最基础的问题：
+
+> MLIP reliability 是否真的会沿 generative trajectory 发生系统性变化？
+
+### Experiment A — Trajectory reliability
+
+$t \rightarrow U_{\mathrm{MLIP}}$：验证 early → uncertainty high，late → uncertainty low。
+
+### Experiment B — 便宜的 reliability sanity check（可选但强烈建议）
+
+不做 DFT。选取 early high-uncertainty 与 late low-uncertainty 的中间结构，比较两个独立 MLIP 的力预测分歧：
+
+$D_F = \|F_{\text{CHGNet}} - F_{\text{DPA}}\|$（或 CHGNet vs MACE）。
+
+若观察到 $U_{\text{CHGNet}} \uparrow \Rightarrow D_F \uparrow$，则形成 preliminary story：
+generative timestep → MLIP uncertainty → cross-model disagreement。
+
+### Milestone 0 流程
+
+```
+FlowMM → MP-20 sampling → trajectory extraction → CHGNet / MLIP
+       → per-atom uncertainty → uncertainty vs timestep
+       (+ DPA/MACE disagreement) → PRELIMINARY_RESULTS.md → Proposal
+```
+
+### Milestone 0 输出清单
+
+1. FlowMM MP-20 baseline 可复现；
+2. 至少几十条 generation trajectories；
+3. intermediate structures；
+4. MLIP energy / force / per-atom uncertainty；
+5. uncertainty vs timestep 图；
+6. high-UQ atoms fraction vs timestep 图；
+7. 可选：cross-MLIP disagreement sanity check；
+8. 一页 `PRELIMINARY_RESULTS.md`。
+
+### 申请前明确不做
+
+- atom-wise guidance / full TrustFlow（修改 FlowMM sampling 会立刻牵涉 Cartesian force vs fractional coordinate、torus geometry、lattice handling、guidance strength、数值稳定性、力裁剪、评估等问题，容易从 2 天膨胀成 2 周）
+- DFT validation
+- property generation
+- large-scale MP-20 benchmark
+- ablation
+- SOTA comparison
+
+这些是"进入深势实习后要做的事"，而不是"申请前已经做完的事"。
+
+> **STOP. Do not implement reliability-aware guidance until the preliminary results have been reviewed.**
+
+### 申请前最终交付的四样东西
+
+1. 500 字 Proposal（见上文）；
+2. 结构干净、baseline 能跑的 GitHub 仓库；
+3. 1–2 张 preliminary figures：`MLIP uncertainty vs sampling timestep`，最好再加 `uncertainty vs cross-model disagreement`；
+4. 一段 preliminary conclusion，例如（若实验支持）：
+
+> We observe that MLIP uncertainty is substantially higher during early flow sampling and decreases as generated structures approach the material manifold. High-uncertainty states also exhibit larger disagreement between independent atomic models, providing preliminary evidence that unconditional physical guidance may be unreliable during parts of the generative trajectory.
+
+申请故事的落点是"我已经做了足够工作证明这个问题值得做，同时还有明确的研究空间可以在实习期间完成"。"下一步计划……"这句本身是 proposal 的重要组成部分。
+
+---
+
 ## 仓库现状（供后续 session 参考）
 
 - 本仓库是 FlowMM 官方代码的 fork，backbone 位于 `src/flowmm`，数据位于 `data/mp_20` 等。
