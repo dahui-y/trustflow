@@ -1,0 +1,19 @@
+{
+  "n_train_structures": 3000,
+  "n_val_structures": 500,
+  "n_train_atoms": 31103,
+  "n_val_atoms": 5249,
+  "target": "chgnet_site_energy",
+  "features": "chgnet_atom_fea_64",
+  "val_interval_coverage": 0.7828157744332254,
+  "reference_uq_percentiles": {
+    "p50": 0.4203805923461914,
+    "p75": 0.8782923221588135,
+    "p90": 1.5434047222137448,
+    "p95": 1.961577320098875,
+    "p99": 3.090564289093017
+  },
+  "seed": 0,
+  "n_estimators": 500,
+  "elapsed_s": 43.8
+}
