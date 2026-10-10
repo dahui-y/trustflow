@@ -60,15 +60,18 @@ def evaluate_structures_dpa(structures: Sequence[Structure], dp: Any) -> list[DP
         cell = np.asarray(s.lattice.matrix, dtype=np.float64).reshape(1, 9)
         atype = np.array([tmap[x] for x in syms], dtype=np.int64)
         try:
-            e, f, _v, ae, _av = dp.eval(coords, cell, atype, atomic=True)
+            res = dp.eval(coords, cell, atype, atomic=True)
+            e, f = res[0], res[1]
+            ae = res[3] if len(res) > 3 else np.full(len(s), np.nan)
+            f = np.asarray(f, dtype=np.float64).reshape(-1, 3)
+            ae = np.asarray(ae, dtype=np.float64).reshape(-1)
         except Exception as exc:  # noqa: BLE001
-            out.append(DPAResult(None, None, None, error=f"eval: {type(exc).__name__}: {exc}"))
+            out.append(DPAResult(None, None, None, error=f"eval: {type(exc).__name__}: {str(exc)[:300]}"))
             continue
-        f = np.asarray(f, dtype=np.float64).reshape(-1, 3)
         out.append(DPAResult(
             energy=float(np.asarray(e).reshape(-1)[0]),
             forces=f,
-            atomic_energies=np.asarray(ae, dtype=np.float64).reshape(-1),
+            atomic_energies=ae,
             error=None if np.isfinite(f).all() else "non-finite forces",
         ))
     return out

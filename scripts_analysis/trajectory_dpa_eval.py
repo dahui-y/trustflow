@@ -68,6 +68,10 @@ def main() -> None:
                                   "fx_dpa": r.forces[a, 0], "fy_dpa": r.forces[a, 1], "fz_dpa": r.forces[a, 2],
                                   "force_norm_dpa": float(np.linalg.norm(r.forces[a])), "e_atom_dpa": float(r.atomic_energies[a])})
         print(f"step {int(step):5d} (t={t:.2f}): {len(structures)} structures, {n_ok} evaluated  [{time.time() - t0:.0f}s]")
+        if n_ok < len(structures):
+            errs = pd.Series([r.error for r in results if not r.ok]).value_counts().head(3)
+            for e, c in errs.items():
+                print(f"    {c:4d}x  {e[:160]}")
 
     pd.DataFrame(atom_rows).to_parquet(args.out_dir / "dpa_atoms.parquet", index=False)
     pd.DataFrame(struct_rows).to_parquet(args.out_dir / "dpa_structures.parquet", index=False)
