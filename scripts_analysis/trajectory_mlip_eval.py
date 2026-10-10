@@ -7,7 +7,7 @@ table, and a JSON sidecar with the exact settings.
     python scripts_analysis/trajectory_mlip_eval.py outputs/m0/traj.npz outputs/m0/chgnet \
         --n_steps 11 --atom_types_from final
 
-No guidance is computed here. STOP after the audit.
+No guidance is computed here. STOP after the analysis.
 """
 
 from __future__ import annotations

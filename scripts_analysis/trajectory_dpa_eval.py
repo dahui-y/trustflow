@@ -1,4 +1,4 @@
-"""Experiment B, step 1: DPA forces on the same intermediate structures as the CHGNet audit.
+"""Experiment B, step 1: DPA forces on the same intermediate structures as the CHGNet analysis.
 
 Runs in the *mlip* environment (deepmd-kit[torch], pymatgen, pandas, pyarrow). Reads
 the same traj.npz, rebuilds structures with the same atom-type policy and the same

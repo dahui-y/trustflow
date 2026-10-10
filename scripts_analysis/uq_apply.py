@@ -1,4 +1,4 @@
-"""Attach per-atom uncertainty to a trajectory audit table.
+"""Attach per-atom uncertainty to a trajectory reliability analysis table.
 
 Reads <eval_dir>/atoms.parquet and <eval_dir>/atom_fea.npz (rows aligned), applies
 the quantile GBM from <uq_dir>, and writes <eval_dir>/atoms_uq.parquet with

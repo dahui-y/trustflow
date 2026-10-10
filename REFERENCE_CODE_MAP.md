@@ -293,7 +293,7 @@ desc, atom_feat, struct_feat = dp.eval_embedding(coords, cells, atom_types)
 **自训 FlowMM 的要点（来自 `scripts_model/run.py` 与 `conf/default.yaml`）**
 
 - 默认 `train_max_epochs: 2000`（`conf/data/mp_20.yaml`），单卡、`precision: 32`、`gradient_clip_val: 0.5`。**先跑 1 个 epoch 测时间**再决定总 epoch 数。
-- `every_n_epochs_checkpoint.every_n_epochs: 100, save_top_k: -1`：每 100 epoch 保存一个 checkpoint 到 `<run_dir>/every_n_epochs/`。这意味着 **训练到几百 epoch 时就可以用早期 checkpoint 启动轨迹审计**，不必等 2000 epoch 结束。另有 `monitor_metric: val/loss` 的 top-1 checkpoint。
+- `every_n_epochs_checkpoint.every_n_epochs: 100, save_top_k: -1`：每 100 epoch 保存一个 checkpoint 到 `<run_dir>/every_n_epochs/`。这意味着 **训练到几百 epoch 时就可以用早期 checkpoint 启动轨迹分析**，不必等 2000 epoch 结束。另有 `monitor_metric: val/loss` 的 top-1 checkpoint。
 - 输出目录由 `conf/hydra/trash.yaml` 决定：`./runs/trash/<date>/<time>/<model>-<vectorfield>-<id>/`，其中包含 `.hydra/config.yaml`。`load_cfg`（`eval_utils.py:140`）靠这个文件定位，**不要移动 checkpoint 离开其 run 目录**。`runs/` 已在 `.gitignore`。
 - wandb 默认 `mode: online`。无账号时设置环境变量 `WANDB_MODE=offline` 或 `disabled`（`run.py:136` 读取 `WANDB_MODE`）。注意 `load_id_from_wandb` 等辅助函数依赖 run 目录下的 `wandb/` 子目录，但 `load_model` 不依赖。
 - `preprocess_workers: 30`、`num_workers: 40` 按机器核数调低。首次加载会把 CSV 预处理为 `data/mp_20/{train,val,test}_ori.pt`（`.gitignore` 的 `*.pt` 规则会忽略它们）。

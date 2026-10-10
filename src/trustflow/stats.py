@@ -1,4 +1,4 @@
-"""Small dependency-free statistics for the audit (rank correlation, AUROC, binning)."""
+"""Small dependency-free statistics for the analysis (rank correlation, AUROC, binning)."""
 
 from __future__ import annotations
 

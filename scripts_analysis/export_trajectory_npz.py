@@ -5,7 +5,7 @@ objects). The npz is the hand-off format to the MLIP environment; its layout is
 documented in ``src/trustflow/trajectory.py``.
 
     python scripts_analysis/export_trajectory_npz.py \
-        <ckpt_dir>/m0_audit/consolidated_gen_trajectory.pt \
+        <ckpt_dir>/m0_analysis/consolidated_gen_trajectory.pt \
         outputs/m0/traj.npz
 """
 

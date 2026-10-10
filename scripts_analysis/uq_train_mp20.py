@@ -1,7 +1,7 @@
 """Train the per-atom quantile GBM (UQ-MLIP recipe) on CHGNet features of MP-20 crystals.
 
 MP-20 structures are inside CHGNet's training distribution (MPtrj), so this is the
-"in-distribution" reference the trajectory audit is compared against. Runs in the
+"in-distribution" reference the trajectory reliability analysis is compared against. Runs in the
 flowmm env (chgnet 0.3.1 present).
 
     python scripts_analysis/uq_train_mp20.py data/mp_20 outputs/m0/uq_chgnet \

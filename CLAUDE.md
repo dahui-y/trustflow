@@ -7,7 +7,7 @@
 
 ## 不可违反的规则
 
-- **Milestone 0 只做 trajectory reliability audit。不实现任何 guidance。** 停止线：`STOP. Do not implement reliability-aware guidance until the preliminary results have been reviewed.`
+- **Milestone 0 只做 trajectory reliability analysis。不实现任何 guidance。** 停止线：`STOP. Do not implement reliability-aware guidance until the preliminary results have been reviewed.`
 - `help_code/` 下的仓库是只读参考，不修改，不在其中实现项目代码。
 - `src/flowmm/` 是 backbone，Milestone 0 不修改其采样代码；TrustFlow 自己的代码放在 `src/trustflow/` 与 `scripts_analysis/`。
 - 永远不要把 Cartesian MLIP 力直接加到分数坐标速度场上。坐标转换与切向投影见 `REFERENCE_CODE_MAP.md` §1.3。

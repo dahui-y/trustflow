@@ -1,9 +1,9 @@
-"""Milestone 0 figures from a trajectory audit directory.
+"""Milestone 0 figures from a trajectory reliability analysis directory.
 
 Input: <eval_dir>/structures.parquet, <eval_dir>/atoms_uq.parquet (from uq_apply.py;
 falls back to atoms.parquet without UQ panels), optional <uq_dir>/reference_uq.npz.
 
-    python scripts_analysis/plot_trajectory_audit.py outputs/m0/chgnet_ep1300 \
+    python scripts_analysis/plot_trajectory_reliability.py outputs/m0/chgnet_ep1300 \
         --uq_dir outputs/m0/uq_chgnet --out figures/m0
 
 Figures (PNG + SVG; remember `git add -f` because *.png is gitignored):
