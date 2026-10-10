@@ -182,3 +182,7 @@ cython_debug/
 
 # TrustFlow experiment outputs
 outputs/
+
+# TrustFlow figures are tracked despite the global *.png rule
+!figures/
+!figures/**
