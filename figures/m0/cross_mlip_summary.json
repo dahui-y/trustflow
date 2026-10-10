@@ -1,0 +1,24 @@
+{
+  "pooled": {
+    "n": 16,
+    "D_F_median": 7.056050408743136,
+    "D_F_rel_median": 0.5354066811965313,
+    "spearman_uq_DF": -0.43823529411764706,
+    "spearman_uq_DFrel": -0.7852941176470588,
+    "spearman_Fnorm_DF": 0.6205882352941177,
+    "auroc_uq_topdecile_DF": 0.2857142857142857,
+    "auroc_Fnorm_topdecile_DF": 0.6071428571428571
+  },
+  "by_t": {
+    "0.00": {
+      "n": 16,
+      "D_F_median": 7.056050408743136,
+      "D_F_rel_median": 0.5354066811965313,
+      "spearman_uq_DF": -0.43823529411764706,
+      "spearman_uq_DFrel": -0.7852941176470588,
+      "spearman_Fnorm_DF": 0.6205882352941177,
+      "auroc_uq_topdecile_DF": 0.2857142857142857,
+      "auroc_Fnorm_topdecile_DF": 0.6071428571428571
+    }
+  }
+}
