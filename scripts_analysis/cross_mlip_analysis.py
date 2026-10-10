@@ -46,17 +46,33 @@ def merge_tables(chg: pd.DataFrame, dpa: pd.DataFrame) -> pd.DataFrame:
     return m
 
 
+def conditional_spearman(x: np.ndarray, y: np.ndarray, control: np.ndarray, n_bins: int = 10) -> float:
+    """Mean Spearman(x, y) inside equal-count bins of ``control`` (does x add information beyond control?)."""
+    b = quantile_bins(np.asarray(control), n_bins)
+    vals = [spearman(np.asarray(x)[b == k], np.asarray(y)[b == k]) for k in range(n_bins) if (b == k).sum() >= 10]
+    return float(np.nanmean(vals)) if vals else float("nan")
+
+
 def stats_block(g: pd.DataFrame, top_frac: float = 0.1) -> dict:
     thr = g["D_F"].quantile(1 - top_frac)
+    thr_rel = g["D_F_rel"].quantile(1 - top_frac)
     return {
         "n": int(len(g)),
         "D_F_median": float(g["D_F"].median()),
         "D_F_rel_median": float(g["D_F_rel"].median()),
+        # absolute disagreement
         "spearman_uq_DF": spearman(g["uq"], g["D_F"]),
-        "spearman_uq_DFrel": spearman(g["uq"], g["D_F_rel"]),
         "spearman_Fnorm_DF": spearman(g["force_norm"], g["D_F"]),
         "auroc_uq_topdecile_DF": auroc(g["uq"], g["D_F"] >= thr),
         "auroc_Fnorm_topdecile_DF": auroc(g["force_norm"], g["D_F"] >= thr),
+        # relative disagreement (magnitude effect removed)
+        "spearman_uq_DFrel": spearman(g["uq"], g["D_F_rel"]),
+        "spearman_Fnorm_DFrel": spearman(g["force_norm"], g["D_F_rel"]),
+        "auroc_uq_topdecile_DFrel": auroc(g["uq"], g["D_F_rel"] >= thr_rel),
+        "auroc_Fnorm_topdecile_DFrel": auroc(g["force_norm"], g["D_F_rel"] >= thr_rel),
+        # information in uq beyond |F|
+        "spearman_uq_DF_given_Fnorm": conditional_spearman(g["uq"], g["D_F"], g["force_norm"]),
+        "spearman_uq_DFrel_given_Fnorm": conditional_spearman(g["uq"], g["D_F_rel"], g["force_norm"]),
     }
 
 
@@ -84,7 +100,11 @@ def main() -> None:
     for t, g in m.groupby("t"):
         summary["by_t"][f"{t:.2f}"] = stats_block(g)
     tbl = pd.DataFrame(summary["by_t"]).T
+    pd.set_option("display.width", 200)
+    print("--- absolute disagreement D_F ---")
     print(tbl[["n", "D_F_median", "spearman_uq_DF", "spearman_Fnorm_DF", "auroc_uq_topdecile_DF", "auroc_Fnorm_topdecile_DF"]].to_string(float_format=lambda v: f"{v:.3f}"))
+    print("--- relative disagreement D_F / (|F_c|+|F_d|) and uq beyond |F| ---")
+    print(tbl[["D_F_rel_median", "spearman_uq_DFrel", "spearman_Fnorm_DFrel", "auroc_uq_topdecile_DFrel", "auroc_Fnorm_topdecile_DFrel", "spearman_uq_DF_given_Fnorm", "spearman_uq_DFrel_given_Fnorm"]].to_string(float_format=lambda v: f"{v:.3f}"))
     print("pooled:", json.dumps(summary["pooled"], indent=2))
 
     # fig5: disagreement along the flow
