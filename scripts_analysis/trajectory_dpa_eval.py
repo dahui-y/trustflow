@@ -34,13 +34,15 @@ def main() -> None:
     ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--head", default=DEFAULT_HEAD)
     ap.add_argument("--no_prefilter", action="store_true")
+    ap.add_argument("--device", default=None, help="'cpu' forces CPU inference (fallback if CUDA JIT fails)")
+    ap.add_argument("--nlist_backend", default="native", choices=["native", "auto", "vesin", "nv"])
     args = ap.parse_args()
     t0 = time.time()
 
     traj = TrajectoryBundle.load_npz(args.traj_npz)
     steps = np.asarray(args.steps, dtype=np.int64) if args.steps else traj.select_steps(args.n_steps)
     n_samples = traj.num_samples if args.max_samples is None else min(args.max_samples, traj.num_samples)
-    dp = load_dpa(args.model, args.head)
+    dp = load_dpa(args.model, args.head, device=args.device, nlist_backend=args.nlist_backend)
     print(f"DPA {args.model} head={args.head}: {len(dp.get_type_map())} element types, rcut={dp.get_rcut()}")
     args.out_dir.mkdir(parents=True, exist_ok=True)
 

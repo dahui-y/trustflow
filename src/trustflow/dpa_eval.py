@@ -31,12 +31,35 @@ class DPAResult:
         return self.error is None
 
 
-def load_dpa(model: str = DEFAULT_MODEL, head: str | None = DEFAULT_HEAD) -> Any:
-    """``DeepPot`` for a registry name (auto-download) or a local .pt/.pth path."""
+def load_dpa(
+    model: str = DEFAULT_MODEL,
+    head: str | None = DEFAULT_HEAD,
+    device: str | None = None,
+    nlist_backend: str = "native",
+) -> Any:
+    """``DeepPot`` for a registry name (auto-download) or a local .pt/.pth path.
+
+    - ``device="cpu"`` must be decided before deepmd is imported (it reads ``DEVICE``).
+    - TorchScript GPU operator fusion is disabled: it JIT-compiles kernels through
+      nvrtc, which is absent in pip-installed CUDA-13 torch builds.
+    - ``nlist_backend="native"`` avoids the fixed-capacity vesin CUDA neighbor list,
+      which overflows on dense early-timestep structures.
+    """
+    import os
+
+    if device == "cpu":
+        os.environ["DEVICE"] = "cpu"
+    import torch
+
+    for fn in ("_jit_override_can_fuse_on_gpu", "_jit_set_texpr_fuser_enabled", "_jit_set_nvfuser_enabled"):
+        try:
+            getattr(torch._C, fn)(False)
+        except Exception:  # noqa: BLE001 - not every torch build has every switch
+            pass
     from deepmd.infer import DeepPot
 
     try:
-        return DeepPot(model, head=head)
+        return DeepPot(model, head=head, nlist_backend=nlist_backend)
     except AssertionError as exc:  # head missing / misspelled: surface the available heads
         raise SystemExit(f"DPA head selection failed for head={head!r}: {exc}") from exc
 
