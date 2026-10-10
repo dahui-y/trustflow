@@ -32,11 +32,19 @@ class AtomwiseResult:
 
 
 def load_chgnet(model_name: str = "0.3.0", device: str | None = None, on_isolated_atoms: str = "warn") -> Any:
-    """Load CHGNet and relax the isolated-atom policy (default 'error' would raise on
-    early-timestep structures with large cells)."""
+    """Load CHGNet (works with both the 0.3.x and 0.4.x ``load`` signatures), move it to
+    ``device`` (default: cuda if available), and relax the isolated-atom policy (the
+    default 'error' would raise on early-timestep structures with large cells)."""
+    import torch
     from chgnet.model.model import CHGNet
 
-    model = CHGNet.load(model_name=model_name, use_device=device, verbose=False)
+    try:  # chgnet >= 0.4
+        model = CHGNet.load(model_name=model_name, use_device=device, verbose=False)
+    except TypeError:  # chgnet 0.3.x: load(model_name) only
+        model = CHGNet.load(model_name=model_name)
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = model.to(device)
     model.graph_converter.set_isolated_atom_response(on_isolated_atoms)
     return model
 
