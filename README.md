@@ -1,3 +1,110 @@
+# TrustFlow
+
+**Knowing When and Where to Trust Large Atomic Models in Crystal Generative Flows**
+**面向晶体生成的可信大原子模型物理引导**
+
+晶体生成模型（FlowMM）可以用大原子模型（CHGNet、DPA）提供的力做物理引导。但生成轨迹上的中间结构可能远离大原子模型的训练分布，此时它给出的力未必可靠。TrustFlow 研究一个在现有 energy-guidance 工作中被默认成立的前提：**大原子模型在生成轨迹的什么时间、哪些原子上值得相信。**
+
+```
+Crystal generator (FlowMM)  ──►  intermediate structures  ──►  Large Atomic Model (CHGNet / DPA)
+                                                                          │
+                                        when & where is it reliable?  ◄───┘
+                                                                          │
+                                              selective, atom-wise physics guidance  g = r · F
+```
+
+> 当前状态：**Milestone 0 完成**（轨迹可信度分析，2026-10-11）。尚未实现任何 guidance。
+
+---
+
+## 三个发现（MP-20 自训 FlowMM，256 条轨迹，24 688 个原子）
+
+**1. 大原子模型的可靠性沿生成轨迹有明确的时间结构，且只在流的后 40% 恢复。**
+
+| | t ≤ 0.4 | t = 1.0 | MP-20 验证集（分布内） |
+|---|---|---|---|
+| CHGNet per-atom 不确定性中位 (eV) | 1.7–1.8 | 1.03 | 0.42 |
+| 超过分布内 p95 的原子比例 | 33–36 % | 8 % | 5 % |
+
+<p align="center"><img src="figures/m0_final/fig1_uq_vs_t.png" width="520"></p>
+
+**2. 两个独立的大原子模型在中间态上严重分歧。** CHGNet 与 DPA-3.1（同为 MPtrj 训练）的相对力分歧 |F_C − F_D| / (|F_C| + |F_D|) 中位数从 t = 0 的 0.56 降到 t = 1 的 0.19。早期两模型给出的力方向接近无关；无条件使用任一模型的力做引导都不可靠。这条证据不依赖任何不确定性方法。
+
+<p align="center"><img src="figures/m0_final/fig5_disagreement_vs_t.png" width="520"></p>
+
+**3. 现成的 per-atom 不确定性（UQ-MLIP 的 quantile GBM）能部分预测跨模型分歧，携带了力大小之外的信息，但在轨迹后期失效。** 固定 |F| 后，UQ 与分歧的条件 Spearman 为 0.30；t ≥ 0.8 时对相对分歧的 AUROC 降到 0.5 附近，而这正是物理引导最有作用的区间。**因此下一阶段的首要任务是 reliability estimator，而不是 guidance。**
+
+完整数字、每次运行的设置与局限：[`PRELIMINARY_RESULTS.md`](PRELIMINARY_RESULTS.md)、[`EXPERIMENT_LOG.md`](EXPERIMENT_LOG.md)。全部六张图在 [`figures/m0_final/`](figures/m0_final/)。
+
+---
+
+## 项目结构
+
+```
+PROJECT_BRIEF.md          研究问题、三个 RQ、Milestone 0 范围与停止线
+REFERENCE_CODE_MAP.md     FlowMM 与参考库的代码事实、数据流、已确认决策、环境方案
+PRELIMINARY_RESULTS.md    Milestone 0 结果
+EXPERIMENT_LOG.md         每次实验的设置与数字
+src/flowmm/               FlowMM backbone（上游代码，采样部分未修改）
+src/trustflow/            TrustFlow 自己的代码
+  trajectory.py             轨迹 npz 数据契约、中间结构重建、几何预过滤
+  chgnet_eval.py            CHGNet per-atom 力 / site energy / 64 维特征
+  uq.py                     quantile GBM 不确定性（UQ-MLIP 方法的独立实现）
+  dpa_eval.py               DPA（DeePMD-kit）per-atom 力，作为独立参考
+  stats.py                  Spearman / AUROC / 分位分箱
+scripts_analysis/         流水线脚本（见下）
+tests/                    22 个单元测试，不依赖 torch / chgnet / deepmd
+figures/m0_final/         最终结果图；figures/m0/ 为 epoch 1300 的早期版本（结论一致）
+help_code/                只读参考实现，不属于本项目代码（见文末）
+```
+
+## 复现
+
+两个 conda 环境：`flowmm`（训练、采样、CHGNet，见 `environment.yml` 与 `REFERENCE_CODE_MAP.md` §7 的踩坑记录）和 `mlip`（DPA，见 `ENV_MLIP.md`）。两者通过 `outputs/*/traj.npz` 与 parquet 表衔接。
+
+```bash
+# 1. 训练 FlowMM（flowmm 环境，RTX 4090 约 26 h；每 100 epoch 存一个 checkpoint）
+WANDB_MODE=disabled python scripts_model/run.py data=mp_20 model=abits_params
+
+# 2. 导出 256 条生成轨迹的全部中间状态
+CKPT=<run_dir>/every_n_epochs/epoch=1999-step=212000.ckpt
+python scripts_model/evaluate.py gen_trajectory "$CKPT" --num_samples 256 --batch_size 256 --num_steps 1000 --single_gpu --subdir m0_final
+python scripts_model/evaluate.py consolidate "$CKPT" --subdir m0_final
+python scripts_analysis/export_trajectory_npz.py "$(dirname "$CKPT")/m0_final/consolidated_gen_trajectory.pt" outputs/m0_final/traj.npz
+
+# 3. CHGNet per-atom 评估 + 不确定性 + 图 1–4
+python scripts_analysis/trajectory_mlip_eval.py outputs/m0_final/traj.npz outputs/m0_final/chgnet --n_steps 11 --save_atom_fea
+python scripts_analysis/uq_train_mp20.py data/mp_20 outputs/m0/uq_chgnet --n_train 3000 --n_val 500
+python scripts_analysis/uq_apply.py outputs/m0_final/chgnet outputs/m0/uq_chgnet
+python scripts_analysis/plot_trajectory_reliability.py outputs/m0_final/chgnet --uq_dir outputs/m0/uq_chgnet --out figures/m0_final
+
+# 4. DPA 参考力 + 跨模型分歧 + 图 5–6（mlip 环境）
+python scripts_analysis/trajectory_dpa_eval.py outputs/m0_final/traj.npz outputs/m0_final/dpa --n_steps 11
+python scripts_analysis/cross_mlip_analysis.py outputs/m0_final/chgnet outputs/m0_final/dpa --out figures/m0_final
+```
+
+每个脚本都写出 `meta.json`，记录参数、步数、样本数和耗时。`python -m pytest tests -q` 运行单元测试。
+
+## 路线
+
+| 阶段 | 内容 | 状态 |
+|---|---|---|
+| Milestone 0 | 轨迹可信度分析：CHGNet UQ 与 CHGNet–DPA 分歧沿轨迹、沿原子的分布 | 完成 |
+| 1 | Reliability estimator 对比：site-energy 分位宽度 vs 以跨模型分歧为目标的 GBM vs embedding 距离 vs DPA 多模型 deviation，评价标准为 t ≥ 0.8 的 AUROC | 下一步 |
+| 2 | 固定物理引导 baseline，测量 negative transfer rate | |
+| 3 | TrustFlow：基于最优 estimator 的 atom-wise selective guidance，与无引导 / 固定引导的 paired experiments | |
+
+## 关于 `help_code/`
+
+`help_code/` 下是只读的参考实现：UQ-MLIP、CHGNet、DeePMD-kit、DiffCSP、OMatG。它们用于理解接口和已有方法，不属于 TrustFlow 的实现，也未被修改。`src/trustflow/uq.py` 是 UQ-MLIP 方法的独立重写，以便在不同 Python 版本的环境中使用。
+
+---
+---
+
+# Backbone: FlowMM（上游 README 原文）
+
+以下为 [facebookresearch/flowmm](https://github.com/facebookresearch/flowmm) 的原始 README，本仓库的 `src/flowmm`、`scripts_model`、`data` 均来自该项目。TrustFlow 未修改其采样代码。
+
 # FlowMM: Generating Materials with Riemannian Flow Matching
 
 <div align="center">
