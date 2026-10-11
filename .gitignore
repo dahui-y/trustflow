@@ -186,3 +186,7 @@ outputs/
 # TrustFlow figures are tracked despite the global *.png rule
 !figures/
 !figures/**
+
+# preprocessed dataset caches and Lightning predict logs
+data/**/*_ori.pt
+lightning_logs/
