@@ -1,0 +1,30 @@
+{
+  "argv": [
+    "scripts_analysis/trajectory_dpa_eval.py",
+    "outputs/m0_final/traj.npz",
+    "outputs/m0_final/dpa",
+    "--n_steps",
+    "11"
+  ],
+  "traj_npz": "/output/trustflow/outputs/m0_final/traj.npz",
+  "steps": [
+    0,
+    100,
+    200,
+    300,
+    400,
+    500,
+    600,
+    700,
+    800,
+    900,
+    1000
+  ],
+  "model": "DPA-3.1-3M",
+  "head": "MP_traj_v024_alldata_mixu",
+  "type_map_size": 118,
+  "atom_types_from": "final",
+  "n_samples": 256,
+  "n_atom_rows": 24688,
+  "elapsed_s": 754.4
+}
