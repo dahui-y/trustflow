@@ -40,6 +40,15 @@ t ≤ 0.5 是平台，t ∈ [0.6, 1] 快速下降（fig1、fig2、fig3）。即�
 - **RQ2（where）弱成立**：同一时间步内 UQ 与跨模型分歧有独立于几何的相关，但强度有限。
 - **估计器需要改进**：UQ-MLIP 的默认目标（site energy 分位宽度）在接近流形的后期失去判别力，而这正是 guidance 起作用的区间。按 PROJECT_BRIEF 的转向条件，下一步优先研究 reliability estimator（例如直接以跨模型分歧为目标训练、embedding 距离、DPA 多模型 deviation），再进入 selective guidance。
 
+## 与已有工作的关系
+
+- **uMLIP 在分布外环境的系统性误差**：Deng 等（npj Comput. Mater. 2025，[Systematic softening in universal MLIPs](https://www.nature.com/articles/s41524-024-01500-6)）证明 M3GNet、CHGNet、MACE-MP-0 在高能态与分布外原子环境下系统性低估力。本项目把这一现象放到生成轨迹的时间维与原子维上刻画。
+- **uMLIP 的不确定性估计**：[Heterogeneous Ensemble 一文](https://arxiv.org/pdf/2507.21297)报告 MACE 的 quantile regression 与 Orb 的置信头在 OOD 检测上效果有限，特征空间距离与误差相关更强。与本项目第三个发现一致，并支持阶段 1 把 embedding 距离列为候选 estimator。
+- **力场梯度引导生成**：[Generative structure search](https://arxiv.org/pdf/2604.27636) 在每一步扩散中加入外部力场的能量梯度；OMatG-IRL 用 MACE 能量作 RL 奖励；DiffCSP 用学习到的能量网络做梯度引导。这些工作默认力场在轨迹各处可靠，未对该前提做检验。
+- **时间相关的引导调度**：图像领域已有工作指出不精确的物理引导会淹没扩散模型自身形成的结构，需随时间衰减引导（如 [generative prior for ptychography](https://arxiv.org/pdf/2507.17800)）。本项目的发现为晶体生成中这类调度提供了可测量的依据，并进一步细化到原子级。
+
+截至 2026-10-16 的检索未发现对大原子模型可靠性沿晶体生成轨迹做逐原子刻画的工作，但未做系统综述，不以"首个"自称。
+
 ## 局限
 
 - 单个训练 seed、256 条轨迹；epoch 1300 的 64 条轨迹复跑给出一致结论，说明结果对 checkpoint 和样本量不敏感。
